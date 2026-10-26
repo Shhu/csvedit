@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=CSV Edit
+Comment=Edit CSV files
+Comment[fr]=Modifiez vos fichiers CSV
+Exec=csvedit %f
+Icon=io.github.Shhu.CsvEdit
+Terminal=false
+Categories=Office;Spreadsheet;
+MimeType=text/csv;text/tab-separated-values;
+Keywords=csv;tsv;table;spreadsheet;editor;

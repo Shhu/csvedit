@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.Shhu.CsvEdit</id>
+  <name>CSV Edit</name>
+  <summary>Edit CSV files</summary>
+  <summary xml:lang="fr">Modifiez vos fichiers CSV</summary>
+  <developer id="io.github.shhu">
+    <name>Shhu</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <description>
+    <p>CSV Edit is a simple editor for CSV files, in English and French.</p>
+    <p xml:lang="fr">CSV Edit est un éditeur simple de fichiers CSV, en
+    français et en anglais.</p>
+    <ul>
+      <li>Opens files from Excel and others: comma, semicolon, tab or pipe separated, UTF-8 or Windows-1252, found automatically</li>
+      <li xml:lang="fr">Ouvre les fichiers d'Excel et des autres : séparés par des virgules, points-virgules, tabulations ou barres verticales, en UTF-8 ou Windows-1252, détectés automatiquement</li>
+      <li>Saves them the way they were written, or converts them</li>
+      <li xml:lang="fr">Les enregistre tels qu'ils étaient écrits, ou les convertit</li>
+      <li>An import window with a live preview</li>
+      <li xml:lang="fr">Une fenêtre d'import avec aperçu en direct</li>
+      <li>Only the columns you want ("3, 157"), named A B C, 1 2 3 or 0 1 2</li>
+      <li xml:lang="fr">Seulement les colonnes voulues (« 3, 157 »), nommées A B C, 1 2 3 ou 0 1 2</li>
+      <li>An inspector for long texts and their HTML line breaks</li>
+      <li xml:lang="fr">Un inspecteur pour les longs textes et leurs retours à la ligne HTML</li>
+      <li>Edit cells, insert and delete rows and columns, sort, find, undo</li>
+      <li xml:lang="fr">Modification des cellules, insertion et suppression de lignes et de colonnes, tri, recherche, annulation</li>
+      <li>Copy and paste with spreadsheets</li>
+      <li xml:lang="fr">Copier-coller avec les tableurs</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.Shhu.CsvEdit.desktop</launchable>
+  <url type="homepage">https://shu-app.com/csvedit/</url>
+  <url type="bugtracker">https://github.com/Shhu/csvedit/issues</url>
+  <url type="vcs-browser">https://github.com/Shhu/csvedit</url>
+  <branding>
+    <color type="primary" scheme_preference="light">#bfe8cf</color>
+    <color type="primary" scheme_preference="dark">#1f7a4d</color>
+  </branding>
+  <content_rating type="oars-1.1"/>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <releases>
+    <release version="0.1.0" date="2026-10-26">
+      <description>
+        <p>First version: any delimiter and encoding, an import window with a preview, the columns you want, an inspector, dark and light themes.</p>
+      </description>
+    </release>
+  </releases>
+</component>

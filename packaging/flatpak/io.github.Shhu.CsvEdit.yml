@@ -1,0 +1,49 @@
+# Flatpak of CSV Edit, built from the working tree, from source and without
+# network access: the Rust crates come from cargo-sources.json (made by
+# flatpak-cargo-generator from Cargo.lock, see build.sh).
+app-id: io.github.Shhu.CsvEdit
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: csvedit
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Files opened by path (command line, drag and drop); anything else goes
+  # through the file chooser portal.
+  - --filesystem=xdg-documents
+  - --filesystem=xdg-download
+  - --filesystem=xdg-desktop
+modules:
+  - name: csvedit
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/csvedit/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --verbose
+      - install -Dm755 target/release/csvedit /app/bin/csvedit
+      - install -Dm644 packaging/flatpak/io.github.Shhu.CsvEdit.desktop /app/share/applications/io.github.Shhu.CsvEdit.desktop
+      - install -Dm644 assets/icon.svg /app/share/icons/hicolor/scalable/apps/io.github.Shhu.CsvEdit.svg
+      - install -Dm644 packaging/flatpak/io.github.Shhu.CsvEdit.metainfo.xml /app/share/metainfo/io.github.Shhu.CsvEdit.metainfo.xml
+      - install -Dm644 -t /app/share/licenses/io.github.Shhu.CsvEdit LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md assets/fonts/Inter-OFL.txt assets/fonts/JetBrainsMono-OFL.txt
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .git
+          - .claude
+          - docs
+          - packaging/flatpak/build
+          - packaging/flatpak/repo
+          - packaging/flatpak/.flatpak-builder
+          - packaging/flatpak/csvedit.flatpak
+      - cargo-sources.json
