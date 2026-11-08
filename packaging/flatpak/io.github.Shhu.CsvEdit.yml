@@ -10,11 +10,14 @@ sdk-extensions:
 command: csvedit
 finish-args:
   - --share=ipc
+  # On Wayland, winit 0.30 drops files dragged onto the window: drag and
+  # drop works in X11 sessions only.
   - --socket=wayland
   - --socket=fallback-x11
   - --device=dri
-  # Files opened by path (command line, drag and drop); anything else goes
-  # through the file chooser portal.
+  # Files opened by path (a file manager's "Open With", the command line
+  # with --file-forwarding, X11 drag and drop) in these folders; anything
+  # else goes through the file chooser portal.
   - --filesystem=xdg-documents
   - --filesystem=xdg-download
   - --filesystem=xdg-desktop
@@ -33,7 +36,7 @@ modules:
       - install -Dm644 packaging/flatpak/io.github.Shhu.CsvEdit.desktop /app/share/applications/io.github.Shhu.CsvEdit.desktop
       - install -Dm644 assets/icon.svg /app/share/icons/hicolor/scalable/apps/io.github.Shhu.CsvEdit.svg
       - install -Dm644 packaging/flatpak/io.github.Shhu.CsvEdit.metainfo.xml /app/share/metainfo/io.github.Shhu.CsvEdit.metainfo.xml
-      - install -Dm644 -t /app/share/licenses/io.github.Shhu.CsvEdit LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md assets/fonts/Inter-OFL.txt assets/fonts/JetBrainsMono-OFL.txt
+      - install -Dm644 -t /app/share/licenses/io.github.Shhu.CsvEdit LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.txt assets/fonts/Inter-OFL.txt assets/fonts/JetBrainsMono-OFL.txt
     sources:
       - type: dir
         path: ../..

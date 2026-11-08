@@ -2,17 +2,18 @@
 //! delimiters, quotes…), with a preview of the result.
 
 use std::path::PathBuf;
+use std::sync::{Arc, mpsc};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, Key, Layout, Margin, Rect, Sense, Stroke,
-    StrokeKind, pos2, vec2,
+    self, Align, Align2, Color32, CornerRadius, Key, Layout, Margin, Modifiers, Rect, Sense,
+    Stroke, StrokeKind, pos2, vec2,
 };
 use egui_phosphor::regular as icon;
 
-use crate::app::{encoding_name, flat_text};
+use crate::app::{delimiter_glyph, delimiter_name, encoding_name, flat_text, line_ending_name};
 use crate::columns;
 use crate::i18n::t;
-use crate::table::{self, Encoding, Format, ImportOptions, Table};
+use crate::table::{self, Encoding, ImportOptions, Imported, Preview, TooLarge};
 use crate::theme::{self, Palette, palette};
 
 /// Width of the window.
@@ -26,6 +27,9 @@ const PREVIEW_ROW: f32 = 30.0;
 const PREVIEW_COL: f32 = 180.0;
 const PREVIEW_NUMBER: f32 = 44.0;
 const PREVIEW_VISIBLE: f32 = 8.0;
+/// Seconds the options must stay unchanged before the whole file is read
+/// again with them.
+const SETTLE: f64 = 0.3;
 
 pub enum Outcome {
     Open,
@@ -34,26 +38,34 @@ pub enum Outcome {
 
 pub struct ImportDialog {
     pub path: PathBuf,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     options: ImportOptions,
     /// The first row holds the column names.
     pub header: bool,
-    tab: bool,
-    comma: bool,
-    semicolon: bool,
-    space: bool,
     /// A delimiter of one's own, one or more characters (`!#`).
     other_text: String,
     /// What was guessed when the file was opened, for the footer.
     detected: Option<String>,
-    /// The file read with `options`; `None` when they changed since.
-    parsed: Option<(Table, Format)>,
+    /// The start of the file read with `options`.
+    preview: Option<Preview>,
+    /// The whole file read with some options, in the background.
+    reading: Option<Reading>,
+    /// When `options` last changed (egui time).
+    changed_at: f64,
+    /// The "Other" field had the keyboard at the end of the last frame.
+    other_focused: bool,
+}
+
+/// The whole file being read in the background.
+struct Reading {
+    options: ImportOptions,
+    receiver: mpsc::Receiver<Result<Imported, TooLarge>>,
+    result: Option<Result<Imported, TooLarge>>,
 }
 
 impl ImportDialog {
     pub fn new(path: PathBuf, bytes: Vec<u8>, header: bool) -> Self {
         let options = ImportOptions::detect(&bytes);
-        let has = |d: &str| options.delimiters.iter().any(|o| o == d);
         let other_text = options
             .delimiters
             .iter()
@@ -61,70 +73,131 @@ impl ImportDialog {
             .cloned()
             .unwrap_or_default();
         // Poliris files have no header row.
-        let header = header && !has("!#");
-        let parsed = table::import(&bytes, &options);
-        let format = &parsed.1;
+        let header = header && !options.delimiters.iter().any(|d| d == "!#");
         let detected = (!bytes.is_empty()).then(|| {
-            let delimiter = match format.delimiter.as_str() {
-                "," => t!("delimiter-comma"),
-                ";" => t!("delimiter-semicolon"),
-                "\t" => t!("delimiter-tab"),
-                "|" => t!("delimiter-pipe"),
-                other => other.to_owned(),
+            let sample = table::preview(&bytes, &options, 50);
+            let delimiter = &options.delimiters[0];
+            let mut name = delimiter_name(delimiter);
+            if !matches!(delimiter.as_str(), "\t" | " ") {
+                name = format!("{name} {}", delimiter_glyph(delimiter));
+            }
+            // The line endings of the first rows (all of them, at most 50).
+            let text = table::decode_as(
+                &bytes[..bytes.len().min(table::SAMPLE_BYTES)],
+                options.encoding,
+            )
+            .text;
+            let endings = if text.contains("\r\n") {
+                table::LineEnding::CrLf
+            } else if text.contains('\n') || sample.rows.len() < 2 {
+                table::LineEnding::Lf
+            } else {
+                table::LineEnding::Cr
             };
             t!(
                 "import-detected",
-                delimiter = delimiter.to_lowercase(),
-                encoding = encoding_name(format.encoding),
-                endings = if format.crlf { "CRLF" } else { "LF" }
+                delimiter = name,
+                encoding = encoding_name(options.encoding),
+                endings = line_ending_name(endings)
             )
         });
         Self {
             path,
             header,
-            tab: has("\t"),
-            comma: has(","),
-            semicolon: has(";"),
-            space: has(" "),
             other_text,
             detected,
             options,
-            bytes,
-            parsed: Some(parsed),
+            bytes: Arc::new(bytes),
+            preview: None,
+            reading: None,
+            changed_at: f64::NEG_INFINITY,
+            other_focused: false,
         }
     }
 
-    /// The table read with the chosen options.
-    pub fn into_table(mut self) -> (Table, Format) {
-        self.parse();
-        self.parsed.expect("parsed")
+    /// The file read with the chosen options: the background reading if it
+    /// is done or under way with them, else read now.
+    pub fn into_imported(mut self) -> Result<Imported, TooLarge> {
+        match self.reading.take() {
+            Some(Reading {
+                options,
+                result: Some(result),
+                ..
+            }) if options == self.options => result,
+            Some(Reading {
+                options, receiver, ..
+            }) if options == self.options => receiver
+                .recv()
+                .unwrap_or_else(|_| table::import(&self.bytes, &self.options)),
+            _ => table::import(&self.bytes, &self.options),
+        }
     }
 
-    fn parse(&mut self) -> &(Table, Format) {
-        self.parsed
-            .get_or_insert_with(|| table::import(&self.bytes, &self.options))
+    /// The background reading's result, when it is for the options shown.
+    fn result(&mut self) -> Option<&Result<Imported, TooLarge>> {
+        let reading = self.reading.as_mut()?;
+        if reading.result.is_none() {
+            reading.result = reading.receiver.try_recv().ok();
+        }
+        (reading.options == self.options)
+            .then_some(reading.result.as_ref())
+            .flatten()
     }
 
-    fn update_delimiters(&mut self) {
-        let mut delimiters = Vec::new();
-        for (on, d) in [
-            (self.tab, "\t"),
-            (self.comma, ","),
-            (self.semicolon, ";"),
-            (self.space, " "),
-        ] {
-            if on {
-                delimiters.push(d.to_owned());
-            }
+    /// Reads the whole file again once the options have settled.
+    fn keep_reading(&mut self, ctx: &egui::Context) {
+        let current = self
+            .reading
+            .as_ref()
+            .is_some_and(|r| r.options == self.options);
+        if current {
+            return;
         }
-        if !self.other_text.is_empty() && !delimiters.contains(&self.other_text) {
-            delimiters.push(self.other_text.clone());
+        let now = ctx.input(|i| i.time);
+        if now - self.changed_at < SETTLE {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(SETTLE));
+            return;
         }
-        self.options.delimiters = delimiters;
+        let (sender, receiver) = mpsc::channel();
+        let bytes = Arc::clone(&self.bytes);
+        let options = self.options.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(table::import(&bytes, &options));
+            ctx.request_repaint();
+        });
+        self.reading = Some(Reading {
+            options: self.options.clone(),
+            receiver,
+            result: None,
+        });
+    }
+
+    fn preview_rows(&mut self) -> &Preview {
+        self.preview
+            .get_or_insert_with(|| table::preview(&self.bytes, &self.options, PREVIEW_ROWS))
+    }
+
+    /// Ticks or unticks a delimiter, keeping the order they were chosen in.
+    fn toggle_delimiter(&mut self, delimiter: &str) {
+        let list = &mut self.options.delimiters;
+        if let Some(i) = list.iter().position(|d| d == delimiter) {
+            list.remove(i);
+        } else {
+            list.push(delimiter.to_owned());
+        }
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> Option<Outcome> {
         let mut outcome = None;
+        // Read before the fields: a single-line field drops the keyboard
+        // in the frame Enter is pressed.
+        let typing = ctx.memory(|m| m.focused().is_some());
+        // Escape leaves the "Other" field, not the window.
+        if self.other_focused {
+            ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        }
+        self.keep_reading(ctx);
         let dark = ctx.global_style().visuals.dark_mode;
         let p = if dark { &theme::DARK } else { &theme::LIGHT };
         let frame = egui::Frame::new()
@@ -152,7 +225,8 @@ impl ImportDialog {
                         self.preview(ui);
                     });
                 if self.options != before {
-                    self.parsed = None;
+                    self.preview = None;
+                    self.changed_at = ui.input(|i| i.time);
                 }
                 if let Some(o) = self.footer(ui) {
                     outcome = Some(o);
@@ -161,11 +235,12 @@ impl ImportDialog {
         if modal.should_close() && outcome.is_none() {
             outcome = Some(Outcome::Cancel);
         }
-        if outcome.is_none()
-            && !ctx.egui_wants_keyboard_input()
-            && ctx.input(|i| i.key_pressed(Key::Enter))
-        {
+        if outcome.is_none() && !typing && ctx.input(|i| i.key_pressed(Key::Enter)) {
             outcome = Some(Outcome::Open);
+        }
+        // A file too large to open can't be imported.
+        if matches!(outcome, Some(Outcome::Open)) && matches!(self.result(), Some(Err(_))) {
+            outcome = None;
         }
         outcome
     }
@@ -179,19 +254,28 @@ impl ImportDialog {
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         let header = self.header;
-        let skip = self.options.skip_lines;
-        let (table, _) = self.parse();
-        let rows = table.row_count() - usize::from(header && table.row_count() > 1);
-        let cols = table.col_count();
-        let mut summary = format!(
-            "{} \u{b7} {}",
-            t!("import-data-rows", count = rows),
-            t!("import-columns", count = cols)
-        );
-        if header {
+        let first_line = self.preview_rows().lines.first().copied();
+        let mut summary = match self.result() {
+            Some(Ok(imported)) => {
+                let rows = imported.table.row_count();
+                let rows = rows - usize::from(header && rows > 1);
+                format!(
+                    "{} \u{b7} {}",
+                    t!("import-data-rows", count = rows),
+                    t!("import-columns", count = imported.table.col_count())
+                )
+            }
+            Some(Err(too_large)) => t!(
+                "import-too-large",
+                rows = too_large.rows,
+                cols = too_large.cols
+            ),
+            None => t!("import-reading"),
+        };
+        if header && let Some(line) = first_line {
             summary.push_str(&format!(
                 " \u{b7} {}",
-                t!("import-header-line", line = skip + 1)
+                t!("import-header-line", line = line)
             ));
         }
         let mut close = false;
@@ -226,7 +310,8 @@ impl ImportDialog {
                         ui.label(egui::RichText::new(summary).size(13.0).color(p.muted));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        close = theme::glyph_button(ui, icon::X, 32.0, 16.0, true, false)
+                        let label = t!("cancel");
+                        close = theme::glyph_button(ui, icon::X, 32.0, 16.0, true, false, &label)
                             .on_hover_text(t!("cancel"))
                             .clicked();
                     });
@@ -274,6 +359,14 @@ impl ImportDialog {
                 for (button, glyph, delta) in [(minus, icon::MINUS, -1isize), (plus, icon::PLUS, 1)]
                 {
                     let response = ui.interact(button, ui.id().with(glyph), Sense::click());
+                    response.widget_info(|| {
+                        let name = format!(
+                            "{} {}",
+                            t!("import-start-line"),
+                            if delta < 0 { "−" } else { "+" }
+                        );
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name)
+                    });
                     if response.hovered() {
                         ui.painter().rect_filled(button.shrink(1.0), 7.0, p.raised);
                     }
@@ -329,16 +422,11 @@ impl ImportDialog {
             section_label(ui, &t!("import-separators"));
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                let mut changed = false;
-                for (on, label, glyph) in [
-                    (&mut self.tab, t!("delimiter-tab"), "\u{21e5}"),
-                    (&mut self.comma, t!("delimiter-comma"), ","),
-                    (&mut self.semicolon, t!("delimiter-semicolon"), ";"),
-                    (&mut self.space, t!("delimiter-space"), "\u{2423}"),
-                ] {
-                    if toggle_chip(ui, *on, &label, glyph).clicked() {
-                        *on = !*on;
-                        changed = true;
+                for delimiter in ["\t", ",", ";", " "] {
+                    let on = self.options.delimiters.iter().any(|d| d == delimiter);
+                    let label = delimiter_name(delimiter);
+                    if toggle_chip(ui, on, &label, &delimiter_glyph(delimiter)).clicked() {
+                        self.toggle_delimiter(delimiter);
                     }
                 }
                 // "Other", with its field.
@@ -372,6 +460,7 @@ impl ImportDialog {
                     Stroke::new(1.0, p.line),
                     StrokeKind::Inside,
                 );
+                let before = self.other_text.clone();
                 let response = ui.put(
                     field_rect.shrink2(vec2(4.0, 0.0)),
                     egui::TextEdit::singleline(&mut self.other_text)
@@ -382,9 +471,19 @@ impl ImportDialog {
                         .char_limit(8)
                         .hint_text("!#"),
                 );
+                self.other_focused = response.has_focus();
                 let response = response.on_hover_text(t!("import-other-hint"));
-                if response.changed() || changed {
-                    self.update_delimiters();
+                if response.changed() {
+                    // The new text takes the old one's place.
+                    let list = &mut self.options.delimiters;
+                    let at = list.iter().position(|d| *d == before);
+                    if let Some(at) = at {
+                        list.remove(at);
+                    }
+                    let fresh = !self.other_text.is_empty() && !list.contains(&self.other_text);
+                    if fresh {
+                        list.insert(at.unwrap_or(list.len()), self.other_text.clone());
+                    }
                 }
             });
         });
@@ -431,10 +530,19 @@ impl ImportDialog {
         let p = palette(ui);
         let header = self.header;
         let no_delimiter = self.options.delimiters.is_empty();
-        let skip = self.options.skip_lines;
-        let (table, _) = self.parse();
-        let cols = table.col_count();
-        let rows = &table.rows()[..table.row_count().min(PREVIEW_ROWS)];
+        let total = match self.result() {
+            Some(Ok(imported)) => Some(imported.table.col_count()),
+            _ => None,
+        };
+        let preview = self.preview_rows();
+        let rows = &preview.rows;
+        let lines = &preview.lines;
+        let cols = rows
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(1)
+            .max(total.unwrap_or(0));
         let inner = WIDTH - 2.0 * SIDE;
         let fitting = ((inner - 2.0 - PREVIEW_NUMBER) / PREVIEW_COL).floor() as usize;
         let note = if no_delimiter {
@@ -442,6 +550,7 @@ impl ImportDialog {
         } else if cols > fitting {
             t!(
                 "import-columns-shown",
+                first = columns::label(0),
                 last = columns::label(fitting - 1),
                 count = cols
             )
@@ -468,7 +577,7 @@ impl ImportDialog {
                         .max_height(height)
                         .min_scrolled_height(height)
                         .auto_shrink([false, false])
-                        .show(ui, |ui| preview_table(ui, rows, cols, header, skip, p));
+                        .show(ui, |ui| preview_table(ui, rows, lines, cols, header, p));
                 });
         });
     }
@@ -493,7 +602,25 @@ impl ImportDialog {
                 ui.set_width(WIDTH - SIDE - 16.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    if let Some(detected) = &self.detected {
+                    // Bytes the encoding can't read come first: they would be
+                    // lost.
+                    let invalid = match self.result() {
+                        Some(Ok(imported)) => imported.losses.invalid_bytes,
+                        _ => self.preview_rows().invalid_bytes,
+                    };
+                    let too_large = matches!(self.result(), Some(Err(_)));
+                    if invalid > 0 {
+                        ui.label(
+                            egui::RichText::new(icon::WARNING)
+                                .font(theme::icons(15.0))
+                                .color(p.hl_ink),
+                        );
+                        ui.label(
+                            egui::RichText::new(t!("import-invalid", count = invalid))
+                                .size(12.0)
+                                .color(p.hl_ink),
+                        );
+                    } else if let Some(detected) = &self.detected {
                         ui.label(
                             egui::RichText::new(icon::INFO)
                                 .font(theme::icons(15.0))
@@ -503,7 +630,12 @@ impl ImportDialog {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let import = format!("{}  \u{21b5}", t!("import-open"));
-                        if theme::primary_button(ui, &import, 0.0).clicked() {
+                        let open = ui
+                            .add_enabled_ui(!too_large, |ui| {
+                                theme::primary_button(ui, &import, 0.0)
+                            })
+                            .inner;
+                        if open.clicked() {
                             outcome = Some(Outcome::Open);
                         }
                         if theme::secondary_button(ui, &t!("cancel"), 0.0).clicked() {
@@ -592,6 +724,8 @@ fn dropdown(
         theme::icons(14.0),
         p.muted,
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, value));
+    theme::focus_ring(ui, &response, 8.0);
     egui::Popup::menu(&response).show(|ui| {
         ui.set_min_width(width - 12.0);
         menu(ui);
@@ -652,6 +786,8 @@ fn toggle_chip(ui: &mut egui::Ui, on: bool, label: &str, glyph: &str) -> egui::R
         mark,
         p.faint,
     );
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, label));
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -675,16 +811,22 @@ fn switch_card(ui: &mut egui::Ui, width: f32, on: bool, label: &str, hint: &str)
         pos2(rect.left() + 12.0, rect.center().y - 9.0),
         vec2(32.0, 18.0),
     );
-    let off = p.faint.gamma_multiply(0.45);
+    // Opaque tracks, so that the white knob stands out on both.
+    let off = p.faint.lerp_to_gamma(p.surface, 0.45);
+    let on_fill = if p.dark { p.accent } else { p.ring };
     ui.painter()
-        .rect_filled(track, 9.0, if on { p.accent } else { off });
+        .rect_filled(track, 9.0, if on { on_fill } else { off });
     let knob_x = if on {
         track.right() - 9.0
     } else {
         track.left() + 9.0
     };
-    ui.painter()
-        .circle_filled(pos2(knob_x, track.center().y), 7.0, Color32::WHITE);
+    ui.painter().circle(
+        pos2(knob_x, track.center().y),
+        7.0,
+        Color32::WHITE,
+        Stroke::new(1.0, Color32::from_black_alpha(40)),
+    );
     let x = track.right() + 10.0;
     let text_width = rect.right() - x - 8.0;
     let name = Rect::from_min_size(pos2(x, rect.top() + 9.0), vec2(text_width, 18.0));
@@ -698,6 +840,8 @@ fn switch_card(ui: &mut egui::Ui, width: f32, on: bool, label: &str, hint: &str)
         p.faint,
         Align::Min,
     );
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, label));
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -706,9 +850,9 @@ fn switch_card(ui: &mut egui::Ui, width: f32, on: bool, label: &str, hint: &str)
 fn preview_table(
     ui: &mut egui::Ui,
     rows: &[Vec<String>],
+    lines: &[usize],
     cols: usize,
     header: bool,
-    skip: usize,
     p: &Palette,
 ) {
     let size = vec2(
@@ -748,7 +892,7 @@ fn preview_table(
             ui.painter(),
             pos2(rect.left() + PREVIEW_NUMBER - 10.0, row_rect.center().y),
             Align2::RIGHT_CENTER,
-            (skip + r + 1).to_string(),
+            lines.get(r).copied().unwrap_or(r + 1).to_string(),
             theme::mono(11.0),
             if head { p.accent_ink } else { p.faint },
         );

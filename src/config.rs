@@ -1,4 +1,4 @@
-//! Where CSV Edit keeps its settings (language).
+//! Where CSV Edit keeps its settings (language, theme, column naming).
 
 use std::path::PathBuf;
 
@@ -8,7 +8,9 @@ pub fn dir() -> PathBuf {
     if cfg!(test) {
         return std::env::temp_dir().join("csvedit-test-config");
     }
-    if let Some(roaming) = std::env::var_os("APPDATA") {
+    if cfg!(windows)
+        && let Some(roaming) = std::env::var_os("APPDATA")
+    {
         PathBuf::from(roaming).join("CSV Edit")
     } else if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(config).join("csvedit")

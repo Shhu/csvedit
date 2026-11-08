@@ -127,10 +127,9 @@ pub fn parse_list(text: &str, count: usize) -> Result<Vec<usize>, String> {
         (col < count).then_some(col)
     };
     let mut cols = Vec::new();
-    for token in text
-        .split([',', ';', ' ', '\t'])
-        .filter(|t| !t.trim().is_empty())
-    {
+    let mut seen = vec![false; count];
+    for token in tokens(text) {
+        let token = token.as_str();
         let range = token
             .split_once("..")
             .or_else(|| token.split_once('-'))
@@ -149,12 +148,35 @@ pub fn parse_list(text: &str, count: usize) -> Result<Vec<usize>, String> {
             return Err(token.trim().to_owned());
         };
         for col in found {
-            if !cols.contains(&col) {
+            if !std::mem::replace(&mut seen[col], true) {
                 cols.push(col);
             }
         }
     }
     Ok(cols)
+}
+
+/// The items of a list: split at commas, semicolons and spaces, but not
+/// at spaces around a range's dash ("10 - 20").
+fn tokens(text: &str) -> Vec<String> {
+    let is_range = |c: char| matches!(c, '-' | ':' | '.');
+    let chars: Vec<char> = text.chars().collect();
+    let mut tight = String::with_capacity(text.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if c == ' ' || c == '\t' {
+            let before = chars[..i].iter().rev().find(|c| !c.is_whitespace());
+            let after = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+            if before.is_some_and(|&c| is_range(c)) || after.is_some_and(|&c| is_range(c)) {
+                continue;
+            }
+        }
+        tight.push(c);
+    }
+    tight
+        .split([',', ';', ' ', '\t'])
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A list of columns as `parse_list` reads it, with runs as ranges.
@@ -199,6 +221,10 @@ mod tests {
         assert_eq!(parse_list("2, 400", 334), Err("400".into()));
         assert_eq!(parse_list("0", 10), Err("0".into()));
         assert_eq!(parse_list("x1", 10), Err("x1".into()));
+        assert_eq!(
+            parse_list("10 - 12, a -c", 20),
+            Ok(vec![9, 10, 11, 0, 1, 2])
+        );
         assert_eq!(format_list(&[0, 1, 2, 3, 9, 11, 12]), "A-D, J, L, M");
 
         set(Labels::FromZero);

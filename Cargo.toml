@@ -1,6 +1,6 @@
 [package]
 name = "csvedit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A simple CSV editor"
@@ -15,6 +15,7 @@ encoding_rs = "0.8.42"
 fluent-bundle = "0.16"
 rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
 sys-locale = "0.3"
+unicode-segmentation = "1"
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }

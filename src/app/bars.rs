@@ -113,10 +113,10 @@ impl CsvApp {
                     let enabled = self.can_run(*command);
                     let response = match tool {
                         Tool::Glyph(glyph) => {
-                            theme::glyph_button(ui, glyph, 34.0, 18.0, enabled, false)
+                            theme::glyph_button(ui, glyph, 34.0, 18.0, enabled, false, tip)
                         }
                         Tool::Table(kind) => {
-                            let response = theme::icon_button(ui, 34.0, enabled, false);
+                            let response = theme::icon_button(ui, 34.0, enabled, false, tip);
                             let color = theme::icon_color(ui, &response, enabled, false);
                             paint_table_icon(ui, response.rect, *kind, color);
                             response
@@ -139,8 +139,15 @@ impl CsvApp {
                     t!("command-inspector"),
                     ui.ctx().format_shortcut(&SHORTCUT_INSPECTOR)
                 );
-                let toggle =
-                    theme::glyph_button(ui, icon::SIDEBAR_SIMPLE, 34.0, 18.0, true, self.inspector);
+                let toggle = theme::glyph_button(
+                    ui,
+                    icon::SIDEBAR_SIMPLE,
+                    34.0,
+                    18.0,
+                    true,
+                    self.inspector,
+                    &t!("command-inspector"),
+                );
                 if toggle.on_hover_text(tip).clicked() {
                     self.inspector = !self.inspector;
                 }
@@ -283,8 +290,8 @@ impl CsvApp {
                 pos2(rect.left(), rect.center().y - 10.0),
                 pos2(rect.right(), rect.center().y + 10.0),
             );
-            let text = flat_text(self.table.cell(row, col));
-            let response = ui.allocate_rect(rect, Sense::click());
+            let text = flat_text(&capped(self.table.cell(row, col), 2000));
+            let response = ui.allocate_rect(rect, Sense::CLICK);
             theme::truncated_text(ui, rect, &text, theme::regular(13.0), p.text, Align::Min);
             if response.double_clicked() {
                 self.start_editing(self.table.cell(row, col).to_owned(), self.inspector);
@@ -330,11 +337,15 @@ impl CsvApp {
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                let before = self.format.clone();
-                let crlf = self.format.crlf;
-                selector(ui, None, if crlf { "CRLF" } else { "LF" }, None, |ui| {
-                    ui.selectable_value(&mut self.format.crlf, false, "LF (Linux, macOS)");
-                    ui.selectable_value(&mut self.format.crlf, true, "CRLF (Windows)");
+                let ending = self.format.line_ending;
+                selector(ui, None, line_ending_name(ending), None, |ui| {
+                    for (ending, key) in [
+                        (LineEnding::Lf, t!("line-ending-lf")),
+                        (LineEnding::CrLf, t!("line-ending-crlf")),
+                        (LineEnding::Cr, t!("line-ending-cr")),
+                    ] {
+                        ui.selectable_value(&mut self.format.line_ending, ending, key);
+                    }
                 });
                 theme::vertical_separator(ui, 14.0);
                 let encoding = self.format.encoding;
@@ -391,9 +402,6 @@ impl CsvApp {
                         }
                     },
                 );
-                if self.format != before {
-                    self.format_changed = true;
-                }
             });
         });
     }
@@ -459,6 +467,9 @@ fn selector(
         galley,
         p.text,
     );
+    let name = format!("{} {value}", label.unwrap_or_default());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, name.trim()));
     egui::Popup::menu(&response).show(|ui| {
         ui.set_min_width(180.0);
         menu(ui);
@@ -510,6 +521,9 @@ impl CsvApp {
                 ));
                 let size = vec2(galley.size().x + 20.0, 34.0);
                 let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, t!("columns-choose"))
+                });
                 ui.painter().rect_filled(rect, 8.0, p.accent_soft);
                 theme::paint_galley(
                     ui.painter(),
@@ -519,7 +533,15 @@ impl CsvApp {
                 );
                 response
             }
-            None => theme::glyph_button(ui, icon::COLUMNS, 34.0, 18.0, true, false),
+            None => theme::glyph_button(
+                ui,
+                icon::COLUMNS,
+                34.0,
+                18.0,
+                true,
+                false,
+                &t!("columns-choose"),
+            ),
         };
         let tip = format!(
             "{} ({})",
@@ -529,11 +551,19 @@ impl CsvApp {
         let response = response.on_hover_text(tip);
         let popup_id = egui::Popup::default_response_id(&response);
         let text_id = ui.id().with("columns-text");
+        let opening = self.open_columns || response.clicked();
         if self.open_columns {
             self.open_columns = false;
             egui::Popup::open_id(ui.ctx(), popup_id);
-            ui.memory_mut(|m| m.request_focus(text_id));
-        } else if response.clicked() {
+        }
+        if opening {
+            // The list as it stands now, ready to be changed.
+            self.columns_text = self
+                .shown
+                .as_deref()
+                .map(columns::format_list)
+                .unwrap_or_default();
+            self.columns_error = None;
             ui.memory_mut(|m| m.request_focus(text_id));
         }
         let frame = egui::Frame::popup(ui.style()).inner_margin(12);
@@ -629,7 +659,7 @@ impl CsvApp {
                 for &col in &listed[range] {
                     let mut on = shown.contains(&col);
                     let name = if header_row {
-                        flat_text(self.table.cell(0, col))
+                        flat_text(&capped(self.table.cell(0, col), 200))
                     } else {
                         String::new()
                     };

@@ -4,13 +4,17 @@ A simple CSV editor, in English and French. Written in Rust with
 [egui](https://github.com/emilk/egui).
 
 - Opens files from Excel and others: comma, semicolon, tab or pipe
-  separated, UTF-8 (with or without BOM) or Windows-1252, found
-  automatically.
+  separated (or any delimiter, even several characters long like Poliris'
+  `!#`), UTF-8 (with or without BOM), Windows-1252 or UTF-16, found
+  automatically; Excel's `sep=;` line is understood.
 - Before opening, an import window with a live preview: character set,
   starting line, one or more delimiters, merged delimiters, trimmed spaces,
   quote character, header row.
-- Saves them the way they were written (delimiter, encoding, line endings),
-  or converts them from the status bar.
+- Saves them the way they were written (delimiter, quoting, encoding, line
+  endings, lines skipped at the top), or converts them from the status bar.
+  Saving writes a new file and then replaces the old one, so a failure
+  halfway leaves it whole; if reading left something out (blank lines,
+  trimmed spaces, unreadable bytes), saving over the file asks first.
 - Edit cells, insert and delete rows and columns, sort, find (matches light
   up, Enter goes to the next one), undo and redo, copy and paste with
   spreadsheets.
@@ -35,12 +39,18 @@ A simple CSV editor, in English and French. Written in Rust with
 | Insert a row below, delete the row | Ctrl++, Ctrl+- |
 | Find, next match, previous match | Ctrl+F, Enter, Shift+Enter |
 | Show or hide the inspector | Ctrl+I |
-| Choose the columns shown | Ctrl+Shift+C |
+| Choose the columns shown | Ctrl+K |
 | Apply the text typed in the inspector | Ctrl+Enter |
 | Undo, redo | Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y |
 
-A file can also be opened by dropping it on the window, or given on the
-command line.
+A file can also be opened by dropping it on the window (on Linux, in X11
+sessions only for now: winit doesn't receive dropped files on Wayland), or
+given on the command line. In the Flatpak, files outside Documents,
+Downloads and Desktop are opened from the command line with
+`flatpak run --file-forwarding io.github.Shhu.CsvEdit @@ file.csv @@`.
+
+Very large files are refused when they would make more than 30 million
+cells.
 
 ## Building
 
@@ -66,7 +76,10 @@ Packaging scripts:
   tests check that every key is translated and used.
 - `cargo fmt`, `cargo clippy --all-targets` and `cargo test` must pass. The
   ignored `capture` test renders a screenshot (options at the end of
-  `src/app.rs`).
+  `src/app/mod.rs`).
+- After any change to `Cargo.lock`, regenerate
+  `packaging/flatpak/cargo-sources.json` (see `packaging/flatpak/build.sh`)
+  and `THIRD-PARTY-LICENSES.txt` (`python3 packaging/licenses.py`).
 
 ## License
 
@@ -76,4 +89,7 @@ otherwise, any contribution intentionally submitted for inclusion in CSV Edit
 shall be dual licensed as above, without any additional terms or conditions.
 
 Third-party works embedded in the binaries are listed in
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md); the licenses of the Rust
+crates, with their texts, are in
+[THIRD-PARTY-LICENSES.txt](THIRD-PARTY-LICENSES.txt), shown in the app
+(Help › About › Third-Party Licenses) and attached to every release.

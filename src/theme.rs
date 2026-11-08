@@ -10,6 +10,7 @@ use eframe::egui::{
 
 /// The colors of a theme.
 pub struct Palette {
+    pub dark: bool,
     /// Behind the grid.
     pub bg: Color32,
     /// Title bar, toolbar, status bar, inspector.
@@ -40,6 +41,8 @@ pub struct Palette {
     pub on_accent: Color32,
     /// Over the window behind a dialog.
     pub scrim: Color32,
+    /// The accent under the pointer: a little darker, opaque.
+    pub accent_hover: Color32,
 }
 
 const fn rgb(hex: u32) -> Color32 {
@@ -51,6 +54,7 @@ const fn rgba(r: u8, g: u8, b: u8, alpha: f32) -> Color32 {
 }
 
 pub const DARK: Palette = Palette {
+    dark: true,
     bg: rgb(0x15171C),
     chrome: rgb(0x1B1E24),
     surface: rgb(0x22262E),
@@ -69,9 +73,11 @@ pub const DARK: Palette = Palette {
     ring: rgb(0x3DD68C),
     on_accent: rgb(0x0C1A13),
     scrim: rgba(8, 9, 12, 0.62),
+    accent_hover: rgb(0x35BD7B),
 };
 
 pub const LIGHT: Palette = Palette {
+    dark: false,
     bg: rgb(0xFFFFFF),
     chrome: rgb(0xF6F7F9),
     surface: rgb(0xFFFFFF),
@@ -91,6 +97,7 @@ pub const LIGHT: Palette = Palette {
     ring: rgb(0x31AB70),
     on_accent: rgb(0x0C1A13),
     scrim: rgba(20, 24, 32, 0.38),
+    accent_hover: rgb(0x34B878),
 };
 
 /// The palette of the theme shown.
@@ -170,6 +177,8 @@ pub fn install(ctx: &egui::Context) {
     ctx.style_mut_of(Theme::Dark, |s| style(s, &DARK));
     ctx.style_mut_of(Theme::Light, |s| style(s, &LIGHT));
     ctx.set_theme(saved_theme());
+    // Ctrl+plus and Ctrl+minus insert and delete rows, not zoom.
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
 }
 
 /// Inter and JetBrains Mono (assets/fonts, OFL), with Phosphor icons and
@@ -223,7 +232,89 @@ fn fonts() -> FontDefinitions {
         ),
     ];
     fonts.families.extend(families);
+    // Scripts Inter lacks (Chinese, Japanese, Korean, Arabic, Hebrew,
+    // Thai, Indian scripts): from the system's fonts, when it has them.
+    for (name, data) in system_fallbacks() {
+        fonts
+            .font_data
+            .insert(name.clone(), Arc::new(FontData::from_owned(data)));
+        for family in fonts.families.values_mut() {
+            family.push(name.clone());
+        }
+    }
     fonts
+}
+
+/// Fonts of the system covering other scripts, by file name, in order of
+/// preference.
+fn system_fallbacks() -> Vec<(String, Vec<u8>)> {
+    let (dirs, files): (Vec<std::path::PathBuf>, &[&str]) = if cfg!(windows) {
+        let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+        (
+            vec![std::path::Path::new(&windir).join("Fonts")],
+            &[
+                "segoeui.ttf",
+                "msyh.ttc",
+                "YuGothR.ttc",
+                "malgun.ttf",
+                "Nirmala.ttf",
+                "LeelawUI.ttf",
+            ],
+        )
+    } else {
+        let mut dirs: Vec<std::path::PathBuf> = [
+            "/usr/share/fonts",
+            "/usr/local/share/fonts",
+            // The host's fonts, inside the Flatpak sandbox.
+            "/run/host/fonts",
+            "/run/host/user-fonts",
+        ]
+        .iter()
+        .map(Into::into)
+        .collect();
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(std::path::Path::new(&home).join(".local/share/fonts"));
+        }
+        (
+            dirs,
+            &[
+                "NotoSansCJK-Regular.ttc",
+                "NotoSansCJKsc-Regular.otf",
+                "DroidSansFallbackFull.ttf",
+                "wqy-microhei.ttc",
+                "NotoSansArabic-Regular.ttf",
+                "NotoSansHebrew-Regular.ttf",
+                "NotoSansThai-Regular.ttf",
+                "NotoSansDevanagari-Regular.ttf",
+                "DejaVuSans.ttf",
+            ],
+        )
+    };
+    let mut found = Vec::new();
+    for file in files {
+        if let Some(path) = dirs.iter().find_map(|dir| find_file(dir, file, 4))
+            && let Ok(data) = std::fs::read(path)
+        {
+            found.push((format!("system-{file}"), data));
+        }
+    }
+    found
+}
+
+/// `name` in `dir` or its subfolders, `depth` levels down at most.
+fn find_file(dir: &std::path::Path, name: &str, depth: usize) -> Option<std::path::PathBuf> {
+    let direct = dir.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if depth == 0 {
+        return None;
+    }
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .find_map(|e| find_file(&e.path(), name, depth - 1))
 }
 
 fn style(style: &mut egui::Style, p: &Palette) {
@@ -241,7 +332,11 @@ fn style(style: &mut egui::Style, p: &Palette) {
     s.interact_size.y = 26.0;
     s.menu_margin = Margin::same(6);
     s.scroll.bar_width = 6.0;
-    s.scroll.floating = false;
+    // Floating bars (the only ones egui fades), given their own room so
+    // that they don't cover the cells.
+    s.scroll.floating = true;
+    s.scroll.floating_width = 6.0;
+    s.scroll.floating_allocated_width = 6.0;
     s.scroll.dormant_handle_opacity = 0.3;
     s.scroll.active_handle_opacity = 0.45;
     s.scroll.interact_handle_opacity = 0.6;
@@ -344,7 +439,13 @@ fn theme_file() -> std::path::PathBuf {
 
 /// A square icon button, transparent until hovered; `on` gives it the
 /// accent's soft fill.
-pub fn icon_button(ui: &mut egui::Ui, size: f32, enabled: bool, on: bool) -> egui::Response {
+pub fn icon_button(
+    ui: &mut egui::Ui,
+    size: f32,
+    enabled: bool,
+    on: bool,
+    label: &str,
+) -> egui::Response {
     let sense = if enabled {
         Sense::click()
     } else {
@@ -360,7 +461,22 @@ pub fn icon_button(ui: &mut egui::Ui, size: f32, enabled: bool, on: bool) -> egu
         Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect, 8.0, fill);
+    focus_ring(ui, &response, 8.0);
+    // Painted: named for screen readers by its label.
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     response
+}
+
+/// A ring around a widget that has the keyboard.
+pub fn focus_ring(ui: &egui::Ui, response: &egui::Response, radius: f32) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect,
+            radius,
+            Stroke::new(2.0, palette(ui).ring),
+            StrokeKind::Inside,
+        );
+    }
 }
 
 /// The color of an icon button's glyph.
@@ -385,8 +501,9 @@ pub fn glyph_button(
     glyph_size: f32,
     enabled: bool,
     on: bool,
+    label: &str,
 ) -> egui::Response {
-    let response = icon_button(ui, size, enabled, on);
+    let response = icon_button(ui, size, enabled, on, label);
     let color = icon_color(ui, &response, enabled, on);
     paint_text(
         ui.painter(),
@@ -421,11 +538,14 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Respon
     let size = vec2(width.max(galley.size().x + 36.0), 36.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let fill = if response.hovered() {
-        p.accent.gamma_multiply(0.9)
+        p.accent_hover
     } else {
         p.accent
     };
     ui.painter().rect_filled(rect, 8.0, fill);
+    focus_ring(ui, &response, 8.0);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), text));
     paint_galley(
         ui.painter(),
         rect.center() - galley.size() / 2.0,
@@ -461,6 +581,9 @@ pub fn secondary_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Resp
         galley,
         p.text,
     );
+    focus_ring(ui, &response, 8.0);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), text));
     response
 }
 

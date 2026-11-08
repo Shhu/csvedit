@@ -12,6 +12,8 @@ use crate::theme::{self, palette};
 
 /// Room on each side of the inspector's content.
 const SIDE: f32 = 20.0;
+/// Characters of a cell shown (all of them are edited).
+const SHOWN_CHARS: usize = 20_000;
 
 impl CsvApp {
     pub(super) fn inspector(&mut self, ui: &mut egui::Ui) {
@@ -50,7 +52,8 @@ impl CsvApp {
             ui.set_width(width + (SIDE - 12.0));
             ui.label(caption(t!("inspector-cell")));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let close = theme::glyph_button(ui, icon::X, 30.0, 15.0, true, false);
+                let label = t!("inspector-close");
+                let close = theme::glyph_button(ui, icon::X, 30.0, 15.0, true, false, &label);
                 if close.on_hover_text(t!("inspector-close")).clicked() {
                     self.inspector = false;
                 }
@@ -87,8 +90,19 @@ impl CsvApp {
                 if editing_here {
                     self.inspector_editor(ui);
                 } else {
-                    let job = cell_layout(self.table.cell(row, col), width - 32.0, p);
-                    let response = ui.add(egui::Label::new(job).sense(Sense::click()));
+                    // A cell can hold megabytes: the start is shown.
+                    let text = self.table.cell(row, col);
+                    let shown = capped(text, SHOWN_CHARS);
+                    let cut = shown.len() != text.len();
+                    let job = cell_layout(&shown, width - 32.0, p);
+                    let response = ui.add(egui::Label::new(job).sense(Sense::CLICK));
+                    if cut {
+                        ui.label(
+                            egui::RichText::new(t!("inspector-truncated", count = SHOWN_CHARS))
+                                .size(12.0)
+                                .color(p.faint),
+                        );
+                    }
                     if response.double_clicked() {
                         self.start_editing(self.table.cell(row, col).to_owned(), true);
                     }
@@ -96,19 +110,8 @@ impl CsvApp {
             });
         ui.add_space(12.0);
 
-        // Counts.
-        let text = self
-            .editing
-            .as_deref()
-            .filter(|_| editing_here)
-            .unwrap_or(self.table.cell(row, col));
-        let parts = split_breaks(text);
-        let brs = parts.iter().filter(|(_, br)| *br).count();
-        let chars: usize = parts.iter().map(|(s, _)| s.chars().count()).sum();
-        let words = parts
-            .iter()
-            .map(|(s, _)| s.split_whitespace().count())
-            .sum::<usize>();
+        // Counts, worked out again only when the text changes.
+        let (chars, words, brs) = self.cell_counts(editing_here);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let card = (width - 16.0) / 3.0;
@@ -186,6 +189,8 @@ impl CsvApp {
     /// The selected cell's text being typed in the inspector: Ctrl+Enter
     /// applies it, Escape cancels.
     fn inspector_editor(&mut self, ui: &mut egui::Ui) {
+        // Ctrl+Enter applies; taken before the field could see it.
+        let apply = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Enter));
         let Some(text) = &mut self.editing else {
             return;
         };
@@ -200,24 +205,49 @@ impl CsvApp {
         if self.focus_editor {
             response.request_focus();
             self.focus_editor = false;
+            return;
         }
-        let (apply, cancel) = ui.input(|i| {
-            (
-                i.modifiers.command && i.key_pressed(Key::Enter),
-                i.key_pressed(Key::Escape),
-            )
-        });
-        if cancel {
-            self.editing = None;
-        } else if apply && response.has_focus() {
-            // The line break Ctrl+Enter may have typed is not kept.
-            if let Some(text) = &mut self.editing
-                && text.ends_with('\n')
-            {
-                text.pop();
-            }
+        let escape = ui.input(|i| i.key_pressed(Key::Escape));
+        if response.has_focus() && apply {
             self.commit_editing();
+        } else if response.lost_focus() {
+            // Escape cancels; going elsewhere keeps the text.
+            if escape {
+                self.editing = None;
+            } else {
+                self.commit_editing();
+            }
         }
+    }
+
+    /// Characters (as seen on screen), words and `<BR>` tags of the text
+    /// shown in the inspector.
+    fn cell_counts(&mut self, editing: bool) -> (usize, usize, usize) {
+        let (row, col) = self.selected;
+        let key = (self.generation, row, col);
+        if !editing
+            && let Some((k, counts)) = self.cell_counts
+            && k == key
+        {
+            return counts;
+        }
+        let text = self
+            .editing
+            .as_deref()
+            .filter(|_| editing)
+            .unwrap_or(self.table.cell(row, col));
+        let parts = split_breaks(text);
+        let brs = parts.iter().filter(|(_, br)| *br).count();
+        let chars = parts.iter().map(|(s, _)| grapheme_count(s)).sum();
+        let words = parts
+            .iter()
+            .map(|(s, _)| s.split_whitespace().count())
+            .sum();
+        let counts = (chars, words, brs);
+        if !editing {
+            self.cell_counts = Some((key, counts));
+        }
+        counts
     }
 }
 

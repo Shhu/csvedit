@@ -20,5 +20,12 @@ license, through the `egui-phosphor` crate.
 
 CSV Edit is built with many Rust crates, each under its own license (MIT,
 Apache-2.0, BSD, zlib, Unicode-3.0 and similar permissive licenses, choosing
-the permissive option where a crate offers several); see Cargo.lock for the
-list.
+the permissive option where a crate offers several). Their notices and
+license texts are in THIRD-PARTY-LICENSES.txt (made by
+packaging/licenses.py), which the app shows (Help › About › Third-Party
+Licenses) and every release carries.
+
+On Windows and Linux, the app also uses the system's own fonts, when
+present, for scripts Inter lacks (Chinese, Japanese, Korean, Arabic,
+Hebrew, Thai, Indian scripts); they are read from the system, not
+distributed with CSV Edit.

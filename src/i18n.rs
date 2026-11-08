@@ -253,16 +253,45 @@ mod tests {
         assert!(unused.is_empty(), "unused keys: {unused:?}");
     }
 
-    /// French puts a no-break space before : ; ! ? and inside « »: a line
-    /// must not have a breakable one there.
+    /// French puts a no-break space before : ; ! ? » and after «: never a
+    /// breakable one, nor none at all. Checked in fr.ftl and in the French
+    /// texts of the Flatpak's description.
     #[test]
     fn french_typography() {
-        for line in Lang::Fr.source().lines().filter(|l| !l.starts_with('#')) {
-            for bad in [" :", " ;", " !", " ?", "« ", " »"] {
-                assert!(
-                    !line.contains(bad),
-                    "fr: breakable space in {bad:?}: {line}"
-                );
+        let metainfo = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("packaging/flatpak/io.github.Shhu.CsvEdit.metainfo.xml"),
+        )
+        .expect("metainfo");
+        let ftl = Lang::Fr
+            .source()
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            // The text after the key.
+            .map(|l| l.split_once(" = ").map_or(l, |(_, v)| v));
+        let xml = metainfo.lines().filter(|l| l.contains("xml:lang=\"fr\""));
+        let no_break = |c: char| c == '\u{a0}' || c == '\u{202f}';
+        for line in ftl.chain(xml) {
+            let chars: Vec<char> = line.chars().collect();
+            for (i, &c) in chars.iter().enumerate() {
+                let before = i.checked_sub(1).map(|j| chars[j]);
+                let after = chars.get(i + 1).copied();
+                // "!#" and "(!" are not punctuation of a sentence.
+                let mark = matches!(c, ':' | ';' | '!' | '?' | '»')
+                    && after.is_none_or(char::is_whitespace)
+                    && before.is_some_and(|b| b != '(');
+                if mark {
+                    assert!(
+                        before.is_some_and(no_break),
+                        "fr: no no-break space before {c:?}: {line}"
+                    );
+                }
+                if c == '«' {
+                    assert!(
+                        after.is_some_and(no_break),
+                        "fr: no no-break space after «: {line}"
+                    );
+                }
             }
         }
     }

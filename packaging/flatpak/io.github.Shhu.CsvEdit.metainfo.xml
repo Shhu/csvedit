@@ -15,7 +15,7 @@
     français et en anglais.</p>
     <ul>
       <li>Opens files from Excel and others: comma, semicolon, tab or pipe separated, UTF-8 or Windows-1252, found automatically</li>
-      <li xml:lang="fr">Ouvre les fichiers d'Excel et des autres : séparés par des virgules, points-virgules, tabulations ou barres verticales, en UTF-8 ou Windows-1252, détectés automatiquement</li>
+      <li xml:lang="fr">Ouvre les fichiers d'Excel et des autres : séparés par des virgules, points-virgules, tabulations ou barres verticales, en UTF-8 ou Windows-1252, détectés automatiquement</li>
       <li>Saves them the way they were written, or converts them</li>
       <li xml:lang="fr">Les enregistre tels qu'ils étaient écrits, ou les convertit</li>
       <li>An import window with a live preview</li>
@@ -44,6 +44,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.1.1" date="2026-11-08">
+      <description>
+        <p>Fixes from a full review: the grid scrolls sideways, safer saving (files kept whole on failure, asks before losing lines left out at import), files written back exactly as read (quoting, delimiters, line endings, lines skipped at the top), UTF-16 files, Excel's sep= line, faster import and search on large files, keyboard fixes, and the third-party licenses in the About window.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-26">
       <description>
         <p>First version: any delimiter and encoding, an import window with a preview, the columns you want, an inspector, dark and light themes.</p>

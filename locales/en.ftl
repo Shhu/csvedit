@@ -51,6 +51,7 @@ find-count = { $count ->
    *[other] { $count } matches
 }
 new-row = New row
+column-menu = Column { $column } menu
 
 ## Columns
 
@@ -88,6 +89,10 @@ delimiter-tab = Tab
 delimiter-pipe = Pipe
 delimiter-space = Space
 delimiter-other = Other
+delimiter-poliris = Poliris
+line-ending-lf = LF (Linux, macOS)
+line-ending-crlf = CRLF (Windows)
+line-ending-cr = CR (old Mac)
 encoding-utf8-bom = UTF-8 with BOM
 
 ## Inspector
@@ -113,7 +118,11 @@ inspector-copy = Copy
 inspector-values = Values
 inspector-empty = Empty cells
 inspector-longest = Longest text
-inspector-longest-value = { $count } chars
+inspector-longest-value = { $count ->
+    [one] { $count } char
+   *[other] { $count } chars
+}
+inspector-truncated = Only the first { $count } characters are shown; Edit opens all of it.
 
 ## Files
 
@@ -123,7 +132,7 @@ filter-csv = CSV files
 filter-all = All files
 error-open = Couldn't open { $file }: { $error }
 error-save = Couldn't save { $file }: { $error }
-error-encoding = the character "{ $character }" can't be written in Windows-1252. Choose UTF-8 in the status bar.
+error-encoding = the character "{ $character }" ({ $code }) in { $cell } can't be written in Windows-1252. Change it, or choose UTF-8 in the status bar.
 
 ## Import
 
@@ -132,6 +141,8 @@ import-data-rows = { $count ->
     [one] { $count } data row
    *[other] { $count } data rows
 }
+import-reading = Reading the file…
+import-too-large = too large to open: { $rows } rows × { $cols } columns
 import-columns = { $count ->
     [one] { $count } column
    *[other] { $count } columns
@@ -146,15 +157,19 @@ import-quote-none = None
 import-separators = Separators
 import-other = Other
 import-other-hint = Text between the fields, one or more characters (!# in Poliris files)
-import-header-hint = Makes line 1 the titles
+import-header-hint = Makes the first line read the titles
 import-merge = Merge delimiters
 import-merge-hint = Skips empty fields
 import-trim = Trim spaces
 import-trim-hint = At both ends of cells
 import-preview = Preview
-import-columns-shown = Columns A to { $last } of { $count }
+import-columns-shown = Columns { $first } to { $last } of { $count }
 import-no-separator = No active separator: a single column
 import-detected = Detected automatically: { $delimiter }, { $encoding }, { $endings } line endings
+import-invalid = { $count ->
+    [one] { $count } byte sequence can't be read in this character set and will show as �
+   *[other] { $count } byte sequences can't be read in this character set and will show as �
+}
 import-open = Import
 
 ## Dialogs
@@ -163,7 +178,24 @@ save-changes-title = Save changes?
 save-changes-text = { $file } has unsaved changes.
 save-changes-save = Save
 save-changes-discard = Don't Save
+overwrite-title = Save over { $file }?
+overwrite-text = Reading this file left things out, which saving over it will lose:
+overwrite-blank = { $count ->
+    [one] { $count } blank line
+   *[other] { $count } blank lines
+}
+overwrite-trimmed = { $count ->
+    [one] spaces trimmed around { $count } field
+   *[other] spaces trimmed around { $count } fields
+}
+overwrite-invalid = { $count ->
+    [one] { $count } unreadable byte sequence, saved as �
+   *[other] { $count } unreadable byte sequences, saved as �
+}
+overwrite-save = Save Over It
+overwrite-save-as = Save As…
 cancel = Cancel
 ok = OK
 about-text = A simple editor for CSV files.
 about-license = Free software under the MIT or Apache-2.0 license.
+about-third-party = Third-Party Licenses

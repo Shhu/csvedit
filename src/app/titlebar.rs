@@ -15,46 +15,27 @@ use crate::theme::{self, palette};
 /// Window buttons, as wide as Windows'.
 const WINDOW_BUTTON_WIDTH: f32 = 46.0;
 /// Width of the window border that resizes it.
-const RESIZE_BORDER: f32 = 5.0;
+// Thin, to leave the scroll bars along the window's edges their room.
+const RESIZE_BORDER: f32 = 3.0;
 /// Length of the corners' grip along each border.
 const RESIZE_CORNER: f32 = 12.0;
 
 impl CsvApp {
     pub(super) fn title_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let p = palette(ui);
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
 
         // Empty space moves the window; double-click maximizes. Registered
         // first so that the widgets on top of it take precedence.
         let bar = ui.max_rect();
         let drag_rect = Rect::from_x_y_ranges(ui.clip_rect().x_range(), bar.y_range());
-        let background = ui.interact(drag_rect, ui.id().with("drag"), Sense::click_and_drag());
+        // Not focusable: the keyboard stays with the grid.
+        let background = ui.interact(drag_rect, ui.id().with("drag"), Sense::CLICK | Sense::DRAG);
         if background.double_clicked() {
             ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
         } else if background.drag_started_by(egui::PointerButton::Primary) {
             ctx.send_viewport_cmd(ViewportCommand::StartDrag);
         }
-
-        // File name, a dot when modified, and the app's name, centered.
-        let name = ui
-            .painter()
-            .layout_no_wrap(self.display_name(), theme::semibold(13.0), p.text);
-        let app = ui
-            .painter()
-            .layout_no_wrap(APP_NAME.to_owned(), theme::regular(13.0), p.faint);
-        let dirty = self.dirty();
-        let width = name.size().x + 8.0 + if dirty { 7.0 + 8.0 } else { 0.0 } + app.size().x;
-        let mut x = bar.center().x - width / 2.0;
-        let y = bar.center().y;
-        let name_width = name.size().x;
-        theme::paint_galley(ui.painter(), pos2(x, y - name.size().y / 2.0), name, p.text);
-        x += name_width + 8.0;
-        if dirty {
-            ui.painter().circle_filled(pos2(x + 3.5, y), 3.5, p.accent);
-            x += 7.0 + 8.0;
-        }
-        theme::paint_galley(ui.painter(), pos2(x, y - app.size().y / 2.0), app, p.faint);
 
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
             logo(ui);
@@ -94,8 +75,53 @@ impl CsvApp {
                 if window_button(ui, WindowButton::Minimize, &t!("title-minimize")).clicked() {
                     ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
                 }
+                // The room left between the menus and the buttons.
+                let free = ui.available_rect_before_wrap();
+                self.window_title(ui, bar, free.shrink2(egui::vec2(12.0, 0.0)));
             });
         });
+    }
+
+    /// File name, a dot when modified, and the app's name: centered on the
+    /// bar when they fit in `free`, else the name alone, cut short.
+    fn window_title(&self, ui: &egui::Ui, bar: Rect, free: Rect) {
+        let p = palette(ui);
+        let name = ui
+            .painter()
+            .layout_no_wrap(self.display_name(), theme::semibold(13.0), p.text);
+        let app = ui
+            .painter()
+            .layout_no_wrap(APP_NAME.to_owned(), theme::regular(13.0), p.faint);
+        let dirty = self.dirty();
+        let dot = if dirty { 7.0 + 8.0 } else { 0.0 };
+        let width = name.size().x + 8.0 + dot + app.size().x;
+        let y = bar.center().y;
+        let centered = bar.center().x - width / 2.0;
+        if width <= free.width() {
+            let mut x = centered.clamp(free.left(), free.right() - width);
+            let name_width = name.size().x;
+            theme::paint_galley(ui.painter(), pos2(x, y - name.size().y / 2.0), name, p.text);
+            x += name_width + 8.0;
+            if dirty {
+                ui.painter().circle_filled(pos2(x + 3.5, y), 3.5, p.accent);
+                x += 7.0 + 8.0;
+            }
+            theme::paint_galley(ui.painter(), pos2(x, y - app.size().y / 2.0), app, p.faint);
+        } else if free.width() > dot + 24.0 {
+            let rect = Rect::from_x_y_ranges(free.left()..=free.right() - dot, bar.y_range());
+            theme::truncated_text(
+                ui,
+                rect,
+                &self.display_name(),
+                theme::semibold(13.0),
+                p.text,
+                Align::Center,
+            );
+            if dirty {
+                ui.painter()
+                    .circle_filled(pos2(free.right() - 3.5, y), 3.5, p.accent);
+            }
+        }
     }
 
     fn file_menu(&mut self, ui: &mut egui::Ui) {
@@ -134,14 +160,7 @@ impl CsvApp {
             Some(SHORTCUT_COLUMNS),
             Command::ChooseColumns,
         );
-        ui.menu_button(t!("column-labels"), |ui| {
-            for labels in columns::Labels::ALL {
-                let text = egui::RichText::new(labels.example()).font(theme::mono(13.0));
-                if ui.radio(columns::labels() == labels, text).clicked() {
-                    columns::choose(labels);
-                }
-            }
-        });
+        ui.menu_button(t!("column-labels"), labels_choice);
         if self.shown.is_some() && ui.button(t!("columns-show-all")).clicked() {
             self.show_columns(Vec::new());
         }
@@ -247,8 +266,10 @@ impl CsvApp {
         if let Some(shortcut) = shortcut {
             button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut));
         }
+        // Run once the frame's grid is drawn: a menu over the grid must
+        // not shrink the table it is drawing.
         if ui.add_enabled(self.can_run(command), button).clicked() {
-            self.run(command);
+            self.deferred.push(command);
         }
     }
 }
@@ -435,5 +456,16 @@ fn resize_cursor(direction: ResizeDirection) -> CursorIcon {
         ResizeDirection::SouthEast => CursorIcon::ResizeSouthEast,
         ResizeDirection::NorthWest => CursorIcon::ResizeNorthWest,
         ResizeDirection::SouthWest => CursorIcon::ResizeSouthWest,
+    }
+}
+
+/// The three ways of naming columns, to pick from.
+pub(super) fn labels_choice(ui: &mut egui::Ui) {
+    for labels in columns::Labels::ALL {
+        let text = egui::RichText::new(labels.example()).font(theme::mono(13.0));
+        if ui.radio(columns::labels() == labels, text).clicked() {
+            columns::choose(labels);
+            ui.close();
+        }
     }
 }

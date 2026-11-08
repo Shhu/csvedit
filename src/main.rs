@@ -16,7 +16,12 @@ use eframe::egui;
 fn main() -> eframe::Result {
     i18n::init();
     columns::init();
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    // Absolute: dialogs open in its folder, and saving doesn't depend on
+    // the folder the app was started from.
+    let path = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .map(|p| std::path::absolute(&p).unwrap_or(p));
 
     let viewport = egui::ViewportBuilder::default()
         .with_title(app::APP_NAME)
@@ -42,8 +47,9 @@ fn main() -> eframe::Result {
     // OpenGL stays as a last resort for GPUs without D3D12.
     #[cfg(windows)]
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
-        setup.instance_descriptor.backends =
-            eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::GL;
+        // WGPU_BACKEND still chooses, when a driver misbehaves.
+        setup.instance_descriptor.backends = eframe::wgpu::Backends::from_env()
+            .unwrap_or(eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::GL);
     }
     eframe::run_native(
         app::APP_NAME,

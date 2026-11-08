@@ -6,6 +6,7 @@ mod grid;
 mod inspector;
 mod titlebar;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
@@ -13,7 +14,7 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 use crate::columns;
 use crate::i18n::t;
 use crate::import::{ImportDialog, Outcome};
-use crate::table::{self, Edit, Encoding, Format, Table, Unencodable};
+use crate::table::{self, Edit, Encoding, Format, LineEnding, Losses, Table, Unencodable};
 use crate::theme;
 
 pub use titlebar::resize_grips;
@@ -31,14 +32,18 @@ const SHORTCUT_REDO: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z);
 const SHORTCUT_REDO_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
 const SHORTCUT_FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
-// The spreadsheet shortcuts for inserting and deleting rows.
+// The spreadsheet shortcuts for inserting and deleting rows (Ctrl+= is
+// the + key without Shift).
 const SHORTCUT_INSERT_ROW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus);
+const SHORTCUT_INSERT_ROW_ALT: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals);
 const SHORTCUT_DELETE_ROW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Minus);
 const SHORTCUT_INSPECTOR: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::I);
-const SHORTCUT_COLUMNS: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::C);
+// Not Ctrl+Shift+C: the system reads any Ctrl+C as Copy.
+const SHORTCUT_COLUMNS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::K);
 
-/// What waits for an answer to "Save changes?".
+/// What waits for an answer to "Save changes?" (or for a file to be
+/// saved).
 #[derive(Clone, Debug)]
 enum Pending {
     New,
@@ -47,7 +52,15 @@ enum Pending {
     Quit,
 }
 
-#[derive(Clone, Copy)]
+/// A file dialog to show, at the end of the frame (it needs the window).
+#[derive(Clone, Debug)]
+enum FileRequest {
+    Open,
+    /// Then what was waiting for the file to be saved.
+    SaveAs(Option<Pending>),
+}
+
+#[derive(Clone, Copy, Debug)]
 enum Command {
     New,
     Open,
@@ -92,8 +105,24 @@ impl Density {
 struct ColumnStats {
     filled: usize,
     empty: usize,
-    /// In characters.
+    /// In characters as seen on screen (grapheme clusters).
     longest: usize,
+}
+
+/// A cell at some point of the table's history: (generation, row, column).
+type CellKey = (u64, usize, usize);
+/// Characters, words and `<BR>` tags of a cell.
+type Counts = (usize, usize, usize);
+
+/// Where the text being found was found.
+#[derive(Default)]
+struct Matches {
+    /// (generation, needle, columns shown) they were found for.
+    key: Option<(u64, String, Option<Vec<usize>>)>,
+    /// In the order the cells are shown: by row, then by shown column.
+    cells: Vec<(usize, usize)>,
+    /// The same, to light the cells up.
+    set: HashSet<(usize, usize)>,
 }
 
 pub struct CsvApp {
@@ -105,8 +134,19 @@ pub struct CsvApp {
     /// Length of `undo` when last saved; `None` once that state can't be
     /// reached again.
     saved_depth: Option<usize>,
-    /// The delimiter, encoding or line endings changed since the last save.
-    format_changed: bool,
+    /// The format as last saved or opened.
+    saved_format: Format,
+    /// What reading the file left out: saving over it asks first.
+    losses: Losses,
+    /// Saving over the opened file despite `losses` was accepted.
+    overwrite_accepted: bool,
+    /// "Save over the original?" is asked, then this waits.
+    confirm_overwrite: Option<Option<Pending>>,
+    file_request: Option<FileRequest>,
+    /// Commands chosen in menus, run once the frame's grid is drawn.
+    deferred: Vec<Command>,
+    /// The grid handled a key this frame: the keyboard stays with it.
+    grid_keys: bool,
     /// Counts the table's changes, for the caches.
     generation: u64,
     /// The first row holds the column names: it stays at the top and is
@@ -120,13 +160,19 @@ pub struct CsvApp {
     edit_in_inspector: bool,
     focus_editor: bool,
     scroll_to_selection: bool,
+    /// The grid reached the selected cell this frame.
+    scrolled: bool,
+    /// Frames spent so far trying to reach it.
+    scroll_tries: u8,
+    /// The cell's editor was drawn this frame.
+    editor_drawn: bool,
     find: String,
     focus_find: bool,
-    /// Cells containing the text being found, in reading order.
-    matches: Vec<(usize, usize)>,
-    /// (`generation`, needle) `matches` was computed for.
-    matches_key: Option<(u64, String)>,
-    column_stats: Option<(u64, usize, ColumnStats)>,
+    matches: Matches,
+    /// (generation, column, first data row) and the stats found then.
+    column_stats: Option<(u64, usize, usize, ColumnStats)>,
+    /// (generation, row, column) and the inspector's counts then.
+    cell_counts: Option<(CellKey, Counts)>,
     inspector: bool,
     /// The columns shown, in this order; `None`: all of them.
     shown: Option<Vec<usize>>,
@@ -142,6 +188,8 @@ pub struct CsvApp {
     pending: Option<Pending>,
     error: Option<String>,
     about: bool,
+    /// The third-party licenses are shown, from the About window.
+    licenses: bool,
     /// Typed in the status bar, for a delimiter of one's own.
     custom_delimiter: String,
     /// The file being opened, waiting for its import options.
@@ -159,7 +207,13 @@ impl CsvApp {
             undo: Vec::new(),
             redo: Vec::new(),
             saved_depth: Some(0),
-            format_changed: false,
+            saved_format: Format::default(),
+            losses: Losses::default(),
+            overwrite_accepted: false,
+            confirm_overwrite: None,
+            file_request: None,
+            deferred: Vec::new(),
+            grid_keys: false,
             generation: 0,
             header: true,
             selected: (0, 0),
@@ -167,11 +221,14 @@ impl CsvApp {
             edit_in_inspector: false,
             focus_editor: false,
             scroll_to_selection: false,
+            scrolled: false,
+            scroll_tries: 0,
+            editor_drawn: false,
             find: String::new(),
             focus_find: false,
-            matches: Vec::new(),
-            matches_key: None,
+            matches: Matches::default(),
             column_stats: None,
+            cell_counts: None,
             inspector: true,
             shown: None,
             columns_text: String::new(),
@@ -182,6 +239,7 @@ impl CsvApp {
             pending: None,
             error: None,
             about: false,
+            licenses: false,
             custom_delimiter: String::new(),
             import: None,
             allow_close: false,
@@ -194,12 +252,13 @@ impl CsvApp {
     }
 
     fn dirty(&self) -> bool {
-        self.format_changed || self.saved_depth != Some(self.undo.len())
+        self.format != self.saved_format || self.saved_depth != Some(self.undo.len())
     }
 
     fn reset(&mut self, table: Table, format: Format, path: Option<PathBuf>) {
         let fresh = Self {
             table,
+            saved_format: format.clone(),
             format,
             path,
             header: self.header,
@@ -228,18 +287,7 @@ impl CsvApp {
         match action {
             Pending::New => self.reset(Table::default(), Format::default(), None),
             Pending::Open(Some(path)) => self.load(&path),
-            Pending::Open(None) => {
-                let dialog = rfd::FileDialog::new()
-                    .add_filter(t!("filter-csv"), &["csv", "tsv", "txt"])
-                    .add_filter(t!("filter-all"), &["*"]);
-                let dialog = match self.path.as_deref().and_then(Path::parent) {
-                    Some(dir) => dialog.set_directory(dir),
-                    None => dialog,
-                };
-                if let Some(path) = dialog.pick_file() {
-                    self.load(&path);
-                }
-            }
+            Pending::Open(None) => self.file_request = Some(FileRequest::Open),
             Pending::Quit => self.allow_close = true,
         }
     }
@@ -259,44 +307,93 @@ impl CsvApp {
         }
     }
 
-    /// Whether the file was saved.
-    fn save(&mut self) -> bool {
+    /// Saves to the file's path, then runs `then`; asks for a path first
+    /// when there is none, and before writing over a file whose reading
+    /// left things out.
+    fn save(&mut self, then: Option<Pending>) {
         self.commit_editing();
-        match self.path.clone() {
-            Some(path) => self.save_to(&path),
-            None => self.save_as(),
+        let Some(path) = self.path.clone() else {
+            self.file_request = Some(FileRequest::SaveAs(then));
+            return;
+        };
+        if self.losses.any() && !self.overwrite_accepted {
+            self.confirm_overwrite = Some(then);
+            return;
+        }
+        if self.save_to(&path)
+            && let Some(action) = then
+        {
+            self.perform(action);
         }
     }
 
-    fn save_as(&mut self) -> bool {
-        self.commit_editing();
-        let name = self
+    /// The file dialogs, parented to the window so that they stay in front
+    /// of it.
+    fn file_dialog(&mut self, request: FileRequest, frame: &eframe::Frame) {
+        let directory = self
             .path
             .as_deref()
-            .map_or_else(|| t!("untitled-file"), file_name);
-        let dialog = rfd::FileDialog::new()
-            .add_filter(t!("filter-csv"), &["csv", "tsv", "txt"])
-            .set_file_name(name);
-        let dialog = match self.path.as_deref().and_then(Path::parent) {
-            Some(dir) => dialog.set_directory(dir),
-            None => dialog,
-        };
-        match dialog.save_file() {
-            Some(path) => self.save_to(&path),
-            None => false,
+            .and_then(Path::parent)
+            .filter(|dir| !dir.as_os_str().is_empty());
+        let mut dialog = rfd::FileDialog::new()
+            .set_parent(frame)
+            .add_filter(t!("filter-csv"), &["csv", "tsv", "txt"]);
+        if let Some(dir) = directory {
+            dialog = dialog.set_directory(dir);
+        }
+        match request {
+            FileRequest::Open => {
+                // GTK turns "*" into "*.*", which hides files without an
+                // extension: without filter, it shows everything.
+                if cfg!(windows) {
+                    dialog = dialog.add_filter(t!("filter-all"), &["*"]);
+                }
+                if let Some(path) = dialog.pick_file() {
+                    self.load(&path);
+                }
+            }
+            FileRequest::SaveAs(then) => {
+                self.commit_editing();
+                let name = self
+                    .path
+                    .as_deref()
+                    .map_or_else(|| t!("untitled-file"), file_name);
+                if let Some(path) = dialog.set_file_name(name).save_file()
+                    && self.save_to(&path)
+                {
+                    // A new file holds everything: no more to warn about.
+                    self.losses = Losses::default();
+                    if let Some(action) = then {
+                        self.perform(action);
+                    }
+                }
+            }
         }
     }
 
     fn save_to(&mut self, path: &Path) -> bool {
         let result = match table::write(&self.table, &self.format) {
-            Ok(bytes) => std::fs::write(path, bytes).map_err(|e| e.to_string()),
-            Err(Unencodable(c)) => Err(t!("error-encoding", character = c.to_string())),
+            Ok(bytes) => write_safely(path, &bytes).map_err(|e| e.to_string()),
+            Err(Unencodable { character, cell }) => {
+                if let Some((row, col)) = cell {
+                    self.commit_editing();
+                    self.select(row, col);
+                }
+                let place =
+                    cell.map_or_else(String::new, |(row, col)| columns::reference(row, col));
+                Err(t!(
+                    "error-encoding",
+                    character = character.to_string(),
+                    code = format!("U+{:04X}", u32::from(character)),
+                    cell = place
+                ))
+            }
         };
         match result {
             Ok(()) => {
                 self.path = Some(path.to_owned());
                 self.saved_depth = Some(self.undo.len());
-                self.format_changed = false;
+                self.saved_format = self.format.clone();
                 true
             }
             Err(error) => {
@@ -309,6 +406,7 @@ impl CsvApp {
     // Edits
 
     fn commit(&mut self, edit: Edit) {
+        self.remap_shown(&edit);
         let inverse = self.table.apply(edit);
         if self
             .saved_depth
@@ -324,6 +422,7 @@ impl CsvApp {
     fn undo(&mut self) {
         self.commit_editing();
         if let Some(edit) = self.undo.pop() {
+            self.remap_shown(&edit);
             self.redo.push(self.table.apply(edit));
             self.after_change();
         }
@@ -332,6 +431,7 @@ impl CsvApp {
     fn redo(&mut self) {
         self.commit_editing();
         if let Some(edit) = self.redo.pop() {
+            self.remap_shown(&edit);
             self.undo.push(self.table.apply(edit));
             self.after_change();
         }
@@ -376,36 +476,44 @@ impl CsvApp {
         }
     }
 
-    /// A column inserted at `at` is shown, next to the selected one.
-    fn shown_after_insert(&mut self, at: usize) {
-        let selected = self.selected.1;
-        if let Some(shown) = &mut self.shown {
-            let position = shown.iter().position(|&c| c == selected);
-            for c in shown.iter_mut() {
-                if *c >= at {
-                    *c += 1;
+    /// Keeps the shown columns the same ones through `edit`, about to be
+    /// applied (also by undo and redo): inserted columns are shown, after
+    /// the shown column before them.
+    fn remap_shown(&mut self, edit: &Edit) {
+        match edit {
+            Edit::Batch(edits) => {
+                // Applied in order, each on the result of the one before.
+                for edit in edits {
+                    self.remap_shown(edit);
                 }
             }
-            let position = match position {
-                Some(p) if at <= selected => p,
-                Some(p) => p + 1,
-                None => shown.len(),
-            };
-            shown.insert(position, at);
-        }
-    }
-
-    fn shown_after_delete(&mut self, at: usize) {
-        if let Some(shown) = &mut self.shown {
-            shown.retain(|&c| c != at);
-            for c in shown.iter_mut() {
-                if *c > at {
-                    *c -= 1;
+            Edit::InsertCols(at, cols) => {
+                let (at, n) = (*at, cols.len());
+                if let Some(shown) = &mut self.shown {
+                    let position = shown.iter().rposition(|&c| c < at).map_or(0, |p| p + 1);
+                    for c in shown.iter_mut() {
+                        if *c >= at {
+                            *c += n;
+                        }
+                    }
+                    shown.splice(position..position, at..at + n);
                 }
             }
-            if shown.is_empty() {
-                self.shown = None;
+            Edit::RemoveCols(at, n) => {
+                let (at, n) = (*at, *n);
+                if let Some(shown) = &mut self.shown {
+                    shown.retain(|&c| c < at || c >= at + n);
+                    for c in shown.iter_mut() {
+                        if *c >= at + n {
+                            *c -= n;
+                        }
+                    }
+                    if shown.is_empty() {
+                        self.shown = None;
+                    }
+                }
             }
+            _ => {}
         }
     }
 
@@ -414,6 +522,10 @@ impl CsvApp {
         self.editing = Some(text);
         self.edit_in_inspector = in_inspector;
         self.focus_editor = true;
+        // The cell's editor is drawn only when the cell is.
+        if !in_inspector {
+            self.scroll_to_selection = true;
+        }
     }
 
     fn commit_editing(&mut self) {
@@ -453,31 +565,40 @@ impl CsvApp {
 
     fn run(&mut self, command: Command) {
         let (row, col) = self.selected;
-        let blank_row = vec![vec![String::new(); self.table.col_count()]];
-        let blank_col = vec![vec![String::new(); self.table.row_count()]];
+        // Blank rows and columns, built only by the commands that use them.
+        fn blank(rows: usize, cols: usize) -> Vec<Vec<String>> {
+            vec![vec![String::new(); cols]; rows]
+        }
+        let (row_count, col_count) = (self.table.row_count(), self.table.col_count());
+        let blank_row = || blank(1, col_count);
+        let blank_col = || blank(1, row_count);
         match command {
             Command::New => self.request(Pending::New),
             Command::Open => self.request(Pending::Open(None)),
-            Command::Save => {
-                self.save();
-            }
-            Command::SaveAs => {
-                self.save_as();
-            }
+            Command::Save => self.save(None),
+            Command::SaveAs => self.file_request = Some(FileRequest::SaveAs(None)),
             Command::Quit => self.request(Pending::Quit),
             Command::Undo => self.undo(),
             Command::Redo => self.redo(),
             Command::Find => self.focus_find = true,
-            Command::ToggleInspector => self.inspector = !self.inspector,
+            Command::ToggleInspector => {
+                // Text being typed in the inspector isn't left hidden.
+                if self.edit_in_inspector {
+                    self.commit_editing();
+                }
+                self.inspector = !self.inspector;
+            }
             Command::ChooseColumns => self.open_columns = true,
             Command::InsertRowAbove => {
                 self.commit_editing();
-                self.commit(Edit::InsertRows(row, blank_row));
+                let blank = blank_row();
+                self.commit(Edit::InsertRows(row, blank));
                 self.select(row, col);
             }
             Command::InsertRowBelow => {
                 self.commit_editing();
-                self.commit(Edit::InsertRows(row + 1, blank_row));
+                let blank = blank_row();
+                self.commit(Edit::InsertRows(row + 1, blank));
                 self.select(row + 1, col);
             }
             Command::DeleteRow => {
@@ -486,21 +607,20 @@ impl CsvApp {
             }
             Command::InsertColLeft => {
                 self.commit_editing();
-                self.shown_after_insert(col);
-                self.commit(Edit::InsertCols(col, blank_col));
+                let blank = blank_col();
+                self.commit(Edit::InsertCols(col, blank));
                 self.select(row, col);
             }
             Command::InsertColRight => {
                 self.commit_editing();
-                self.shown_after_insert(col + 1);
-                self.commit(Edit::InsertCols(col + 1, blank_col));
+                let blank = blank_col();
+                self.commit(Edit::InsertCols(col + 1, blank));
                 self.select(row, col + 1);
             }
             Command::DeleteCol => {
                 self.editing = None;
                 let shown = self.shown_cols();
                 let position = shown.iter().position(|&c| c == col).unwrap_or(0);
-                self.shown_after_delete(col);
                 self.commit(Edit::RemoveCols(col, 1));
                 // The next column shown, or the previous one at the end.
                 let shown = self.shown_cols();
@@ -528,7 +648,7 @@ impl CsvApp {
     }
 
     /// Pastes tab-separated text (what spreadsheets copy) from the selected
-    /// cell on, growing the table if needed.
+    /// cell on, across the columns as shown, growing the table if needed.
     fn paste(&mut self, text: &str) {
         let lines: Vec<Vec<&str>> = text
             .trim_end_matches(['\r', '\n'])
@@ -538,24 +658,36 @@ impl CsvApp {
         let (row, col) = self.selected;
         let height = lines.len();
         let width = lines.iter().map(Vec::len).max().unwrap_or(0);
+        let shown = self.shown_cols();
+        let position = shown.iter().position(|&c| c == col).unwrap_or(0);
+        // The columns written to: those shown from the selected one on,
+        // then new ones at the end.
+        let missing = (position + width).saturating_sub(shown.len());
+        let count = self.table.col_count();
+        let targets: Vec<usize> = shown[position..]
+            .iter()
+            .copied()
+            .chain(count..count + missing)
+            .take(width)
+            .collect();
         let mut edits = Vec::new();
-        let extra_cols = (col + width).saturating_sub(self.table.col_count());
-        if extra_cols > 0 {
-            let cols = vec![vec![String::new(); self.table.row_count()]; extra_cols];
-            edits.push(Edit::InsertCols(self.table.col_count(), cols));
+        if missing > 0 {
+            let cols = vec![vec![String::new(); self.table.row_count()]; missing];
+            edits.push(Edit::InsertCols(count, cols));
         }
         let extra_rows = (row + height).saturating_sub(self.table.row_count());
         if extra_rows > 0 {
-            let rows = vec![vec![String::new(); self.table.col_count() + extra_cols]; extra_rows];
+            let rows = vec![vec![String::new(); count + missing]; extra_rows];
             edits.push(Edit::InsertRows(self.table.row_count(), rows));
         }
         let cells = lines
             .iter()
             .enumerate()
             .flat_map(|(r, line)| {
+                let targets = &targets;
                 line.iter()
                     .enumerate()
-                    .map(move |(c, text)| (row + r, col + c, (*text).to_owned()))
+                    .map(move |(c, text)| (row + r, targets[c], (*text).to_owned()))
             })
             .collect();
         edits.push(Edit::SetCells(cells));
@@ -569,62 +701,71 @@ impl CsvApp {
         self.find.trim().to_lowercase()
     }
 
-    /// Cells containing the text being found.
+    /// Cells of the shown columns containing the text being found, in the
+    /// order they are shown.
     fn matches(&mut self) -> &[(usize, usize)] {
         let needle = self.needle();
-        let key = (self.generation, needle.clone());
-        if self.matches_key.as_ref() != Some(&key) {
-            self.matches = if needle.is_empty() {
-                Vec::new()
-            } else {
-                self.table
-                    .rows()
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(r, row)| {
-                        let needle = &needle;
-                        row.iter()
-                            .enumerate()
-                            .filter(move |(_, cell)| cell.to_lowercase().contains(needle))
-                            .map(move |(c, _)| (r, c))
-                    })
-                    .collect()
-            };
-            self.matches_key = Some(key);
+        let key = (self.generation, needle.clone(), self.shown.clone());
+        if self.matches.key.as_ref() != Some(&key) {
+            let shown = self.shown_cols();
+            let mut cells = Vec::new();
+            if !needle.is_empty() {
+                for (r, row) in self.table.rows().iter().enumerate() {
+                    for &c in &shown {
+                        if contains_ignoring_case(&row[c], &needle) {
+                            cells.push((r, c));
+                        }
+                    }
+                }
+            }
+            self.matches.set = cells.iter().copied().collect();
+            self.matches.cells = cells;
+            self.matches.key = Some(key);
         }
-        &self.matches
+        &self.matches.cells
+    }
+
+    /// Whether a cell is lit up as a match (`matches()` is called first
+    /// each frame).
+    fn is_match(&self, row: usize, col: usize) -> bool {
+        self.matches.set.contains(&(row, col))
     }
 
     /// Selects the next match after the selected cell (the previous one
     /// `backwards`), wrapping around.
     fn next_match(&mut self, backwards: bool) {
-        let selected = self.selected;
-        let shown = self.shown.clone();
-        let matches: Vec<_> = self
-            .matches()
-            .iter()
-            .copied()
-            .filter(|(_, c)| shown.as_ref().is_none_or(|s| s.contains(c)))
-            .collect();
-        let found = if backwards {
-            matches
-                .iter()
-                .rev()
-                .find(|&&m| m < selected)
-                .or(matches.last())
-        } else {
-            matches.iter().find(|&&m| m > selected).or(matches.first())
+        let shown = self.shown_cols();
+        let order = |&(row, col): &(usize, usize)| {
+            (
+                row,
+                shown.iter().position(|&c| c == col).unwrap_or(usize::MAX),
+            )
         };
-        if let Some(&(row, col)) = found {
+        let here = order(&self.selected);
+        let matches = self.matches();
+        // In shown order: the first one past the selection, or before it.
+        let after = matches.partition_point(|m| order(m) <= here);
+        let before = matches.partition_point(|m| order(m) < here);
+        let found = if backwards {
+            before.checked_sub(1).or(matches.len().checked_sub(1))
+        } else if after < matches.len() {
+            Some(after)
+        } else {
+            (!matches.is_empty()).then_some(0)
+        };
+        if let Some(i) = found {
+            let (row, col) = matches[i];
             self.commit_editing();
             self.select(row, col);
         }
     }
 
     fn column_stats(&mut self, col: usize) -> ColumnStats {
-        if let Some((generation, c, stats)) = self.column_stats
+        let start = self.body_start();
+        if let Some((generation, c, s, stats)) = self.column_stats
             && generation == self.generation
             && c == col
+            && s == start
         {
             return stats;
         }
@@ -633,16 +774,16 @@ impl CsvApp {
             empty: 0,
             longest: 0,
         };
-        for row in &self.table.rows()[self.body_start()..] {
+        for row in &self.table.rows()[start..] {
             let cell = &row[col];
             if cell.trim().is_empty() {
                 stats.empty += 1;
             } else {
                 stats.filled += 1;
             }
-            stats.longest = stats.longest.max(cell.chars().count());
+            stats.longest = stats.longest.max(grapheme_count(cell));
         }
-        self.column_stats = Some((self.generation, col, stats));
+        self.column_stats = Some((self.generation, col, start, stats));
         stats
     }
 
@@ -660,15 +801,20 @@ impl CsvApp {
             (SHORTCUT_UNDO, Command::Undo),
             (SHORTCUT_FIND, Command::Find),
             (SHORTCUT_INSERT_ROW, Command::InsertRowBelow),
+            (SHORTCUT_INSERT_ROW_ALT, Command::InsertRowBelow),
             (SHORTCUT_DELETE_ROW, Command::DeleteRow),
             (SHORTCUT_INSPECTOR, Command::ToggleInspector),
             (SHORTCUT_COLUMNS, Command::ChooseColumns),
         ];
-        // While typing, the text field keeps its own undo.
-        let typing = ctx.egui_wants_keyboard_input();
+        // While typing, the text field keeps its own undo, and the table
+        // isn't changed under it.
+        let typing = ctx.text_edit_focused();
         for (shortcut, command) in shortcuts {
-            let text_command = matches!(command, Command::Undo | Command::Redo);
-            if !(typing && text_command) && ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+            let for_text = matches!(
+                command,
+                Command::Undo | Command::Redo | Command::InsertRowBelow | Command::DeleteRow
+            );
+            if !(typing && for_text) && ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
                 self.run(command);
             }
         }
@@ -677,46 +823,63 @@ impl CsvApp {
     /// Moving around the grid, and typing into the selected cell, when no
     /// text field has the keyboard.
     fn handle_grid_keys(&mut self, ctx: &egui::Context) {
-        if self.editing.is_some() || ctx.egui_wants_keyboard_input() || ctx.any_popup_open() {
+        if self.editing.is_some() || ctx.text_edit_focused() || ctx.any_popup_open() {
             return;
         }
-        let (row, col) = self.selected;
         let last_row = self.table.row_count() - 1;
         let shown = self.shown_cols();
-        let position = shown.iter().position(|&c| c == col).unwrap_or(0);
-        let left = shown[position.saturating_sub(1)];
-        let right = shown[(position + 1).min(shown.len() - 1)];
-        let (first_col, last_col) = (shown[0], shown[shown.len() - 1]);
         let events = ctx.input(|i| i.events.clone());
         for event in events {
+            // Keys after a typed character go to the text being typed.
+            if let Some(editing) = &mut self.editing {
+                match event {
+                    egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                        editing.push_str(&text)
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let (row, col) = self.selected;
+            let position = shown.iter().position(|&c| c == col).unwrap_or(0);
+            let left = shown[position.saturating_sub(1)];
+            let right = shown[(position + 1).min(shown.len() - 1)];
             match event {
                 egui::Event::Key {
                     key,
                     pressed: true,
                     modifiers,
                     ..
-                } if modifiers.is_none() || modifiers.shift_only() => match key {
-                    Key::ArrowUp => self.select(row.saturating_sub(1), col),
-                    Key::ArrowDown => self.select((row + 1).min(last_row), col),
-                    Key::PageUp => self.select(row.saturating_sub(20), col),
-                    Key::PageDown => self.select((row + 20).min(last_row), col),
-                    Key::ArrowLeft => self.select(row, left),
-                    Key::ArrowRight | Key::Tab => self.select(row, right),
-                    Key::Home => self.select(row, first_col),
-                    Key::End => self.select(row, last_col),
-                    Key::Enter | Key::F2 => {
-                        self.start_editing(self.table.cell(row, col).to_owned(), false)
+                } if modifiers.is_none() || modifiers.shift_only() => {
+                    self.grid_keys = true;
+                    match key {
+                        Key::ArrowUp => self.select(row.saturating_sub(1), col),
+                        Key::ArrowDown => self.select((row + 1).min(last_row), col),
+                        Key::PageUp => self.select(row.saturating_sub(20), col),
+                        Key::PageDown => self.select((row + 20).min(last_row), col),
+                        Key::ArrowLeft => self.select(row, left),
+                        Key::Tab if modifiers.shift => self.select(row, left),
+                        Key::ArrowRight | Key::Tab => self.select(row, right),
+                        Key::Home => self.select(row, shown[0]),
+                        Key::End => self.select(row, shown[shown.len() - 1]),
+                        Key::Enter | Key::F2 => {
+                            self.start_editing(self.table.cell(row, col).to_owned(), false)
+                        }
+                        Key::Delete | Key::Backspace if !self.table.cell(row, col).is_empty() => {
+                            self.commit(Edit::SetCells(vec![(row, col, String::new())]));
+                        }
+                        _ => {}
                     }
-                    Key::Delete | Key::Backspace if !self.table.cell(row, col).is_empty() => {
-                        self.commit(Edit::SetCells(vec![(row, col, String::new())]));
-                    }
-                    _ => {}
-                },
-                egui::Event::Text(text) => self.start_editing(text, false),
+                }
+                egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                    self.start_editing(text, false);
+                }
                 egui::Event::Copy => ctx.copy_text(self.table.cell(row, col).to_owned()),
                 egui::Event::Cut => {
                     ctx.copy_text(self.table.cell(row, col).to_owned());
-                    self.commit(Edit::SetCells(vec![(row, col, String::new())]));
+                    if !self.table.cell(row, col).is_empty() {
+                        self.commit(Edit::SetCells(vec![(row, col, String::new())]));
+                    }
                 }
                 egui::Event::Paste(text) => self.paste(&text),
                 _ => {}
@@ -736,18 +899,85 @@ impl CsvApp {
     // Dialogs
 
     fn dialogs(&mut self, ctx: &egui::Context) {
-        if let Some(dialog) = &mut self.import {
+        // Under another dialog, the import window waits (and takes no
+        // keys).
+        let covered =
+            self.pending.is_some() || self.error.is_some() || self.confirm_overwrite.is_some();
+        if !covered && let Some(dialog) = &mut self.import {
             match dialog.show(ctx) {
                 Some(Outcome::Open) => {
                     let dialog = self.import.take().expect("an import dialog");
                     let header = dialog.header;
                     let path = dialog.path.clone();
-                    let (table, format) = dialog.into_table();
-                    self.reset(table, format, Some(path));
-                    self.header = header;
+                    match dialog.into_imported() {
+                        Ok(imported) => {
+                            self.reset(imported.table, imported.format, Some(path));
+                            self.losses = imported.losses;
+                            self.header = header;
+                        }
+                        Err(too_large) => {
+                            self.error = Some(t!(
+                                "error-open",
+                                file = file_name(&path),
+                                error = t!(
+                                    "import-too-large",
+                                    rows = too_large.rows,
+                                    cols = too_large.cols
+                                )
+                            ));
+                        }
+                    }
                 }
                 Some(Outcome::Cancel) => self.import = None,
                 None => {}
+            }
+        }
+        if let Some(then) = self.confirm_overwrite.clone() {
+            let mut answer = None;
+            theme::modal("confirm-overwrite", ctx).show(ctx, |ui| {
+                ui.set_width(440.0);
+                ui.heading(t!("overwrite-title", file = self.display_name()));
+                ui.add_space(4.0);
+                ui.label(t!("overwrite-text"));
+                for (count, key) in [
+                    (self.losses.blank_lines, "blank"),
+                    (self.losses.trimmed, "trimmed"),
+                    (self.losses.invalid_bytes, "invalid"),
+                ] {
+                    if count > 0 {
+                        let line = match key {
+                            "blank" => t!("overwrite-blank", count = count),
+                            "trimmed" => t!("overwrite-trimmed", count = count),
+                            _ => t!("overwrite-invalid", count = count),
+                        };
+                        ui.label(format!("\u{2022} {line}"));
+                    }
+                }
+                ui.add_space(18.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::primary_button(ui, &t!("overwrite-save-as"), 0.0).clicked()
+                        || ui.input(|i| i.key_pressed(Key::Enter))
+                    {
+                        answer = Some(false);
+                    }
+                    if theme::secondary_button(ui, &t!("overwrite-save"), 0.0).clicked() {
+                        answer = Some(true);
+                    }
+                    if theme::secondary_button(ui, &t!("cancel"), 0.0).clicked()
+                        || ui.input(|i| i.key_pressed(Key::Escape))
+                    {
+                        self.confirm_overwrite = None;
+                    }
+                });
+            });
+            if let Some(overwrite) = answer {
+                self.confirm_overwrite = None;
+                if overwrite {
+                    self.overwrite_accepted = true;
+                    self.save(then);
+                } else {
+                    self.file_request = Some(FileRequest::SaveAs(then));
+                }
             }
         }
         if let Some(action) = self.pending.clone() {
@@ -776,7 +1006,9 @@ impl CsvApp {
             });
             if let Some(save) = answer {
                 self.pending = None;
-                if !save || self.save() {
+                if save {
+                    self.save(Some(action));
+                } else {
                     self.perform(action);
                 }
             }
@@ -795,7 +1027,7 @@ impl CsvApp {
                 });
             });
         }
-        if self.about {
+        if self.about && !self.licenses {
             theme::modal("about", ctx).show(ctx, |ui| {
                 ui.set_width(360.0);
                 ui.heading(format!("{APP_NAME} {}", env!("CARGO_PKG_VERSION")));
@@ -809,6 +1041,36 @@ impl CsvApp {
                         || ui.input(|i| i.key_pressed(Key::Escape))
                     {
                         self.about = false;
+                    }
+                    if theme::secondary_button(ui, &t!("about-third-party"), 0.0).clicked() {
+                        self.licenses = true;
+                    }
+                });
+            });
+        }
+        if self.licenses {
+            // The notices the crates' licenses ask to go with the program.
+            const LICENSES: &str = include_str!("../../THIRD-PARTY-LICENSES.txt");
+            theme::modal("licenses", ctx).show(ctx, |ui| {
+                ui.set_width(640.0);
+                ui.heading(t!("about-third-party"));
+                ui.add_space(8.0);
+                let lines: Vec<&str> = LICENSES.lines().collect();
+                let height = ui.text_style_height(&egui::TextStyle::Monospace);
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .auto_shrink([false, false])
+                    .show_rows(ui, height, lines.len(), |ui, range| {
+                        for line in &lines[range] {
+                            ui.label(egui::RichText::new(*line).font(theme::mono(11.0)));
+                        }
+                    });
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::primary_button(ui, &t!("ok"), 80.0).clicked()
+                        || ui.input(|i| i.key_pressed(Key::Escape))
+                    {
+                        self.licenses = false;
                     }
                 });
             });
@@ -836,8 +1098,9 @@ impl CsvApp {
 }
 
 impl eframe::App for CsvApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.grid_keys = false;
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             self.commit_editing();
@@ -850,8 +1113,11 @@ impl eframe::App for CsvApp {
         {
             self.request(Pending::Open(Some(path)));
         }
-        let modal_open =
-            self.pending.is_some() || self.error.is_some() || self.about || self.import.is_some();
+        let modal_open = self.pending.is_some()
+            || self.error.is_some()
+            || self.about
+            || self.import.is_some()
+            || self.confirm_overwrite.is_some();
         if !modal_open {
             self.handle_shortcuts(&ctx);
             self.handle_grid_keys(&ctx);
@@ -902,8 +1168,23 @@ impl eframe::App for CsvApp {
                 .show(ui, |ui| self.inspector(ui));
         }
         egui::CentralPanel::no_frame().show(ui, |ui| self.grid(ui));
+        // Menu commands change the table only once the grid is drawn.
+        for command in std::mem::take(&mut self.deferred) {
+            self.run(command);
+        }
         self.dialogs(&ctx);
         resize_grips(&ctx);
+        if let Some(request) = self.file_request.take() {
+            self.file_dialog(request, frame);
+        }
+        // Tab and arrows move the grid's selection, not egui's keyboard
+        // focus: a button given focus would take Enter and Space.
+        if self.grid_keys
+            && !ctx.text_edit_focused()
+            && let Some(id) = ctx.memory(|m| m.focused())
+        {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
 
         if self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -962,26 +1243,98 @@ pub fn split_breaks(text: &str) -> Vec<(&str, bool)> {
 
 /// Length of the `<br>`, `<BR/>` or `<br />` tag at the start of `text`.
 fn br_tag_len(text: &str) -> Option<usize> {
-    let head = text.get(..6).unwrap_or(text).to_ascii_lowercase();
+    let head = text.as_bytes();
     ["<br>", "<br/>", "<br />"]
         .into_iter()
-        .find(|tag| head.starts_with(tag))
+        .find(|tag| {
+            head.len() >= tag.len() && head[..tag.len()].eq_ignore_ascii_case(tag.as_bytes())
+        })
         .map(str::len)
 }
 
-fn delimiter_name(delimiter: &str) -> String {
+/// Whether `text` holds `needle` (lowercase), ignoring case, without
+/// allocating when the needle is ASCII.
+pub fn contains_ignoring_case(text: &str, needle: &str) -> bool {
+    if needle.is_ascii() {
+        let needle = needle.as_bytes();
+        text.len() >= needle.len()
+            && text
+                .as_bytes()
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle))
+    } else {
+        !text.is_ascii() && text.to_lowercase().contains(needle)
+    }
+}
+
+/// Characters as seen on screen: an accent typed apart or an emoji made
+/// of several code points counts once.
+pub fn grapheme_count(text: &str) -> usize {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    text.graphemes(true).count()
+}
+
+/// At most `max` characters of `text`, for display (a cell can hold
+/// megabytes).
+pub fn capped(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}\u{2026}", &text[..end]).into(),
+        None => text.into(),
+    }
+}
+
+/// Writes `bytes` to a new file beside `path`, then puts it in its place:
+/// a failure halfway leaves the old file whole.
+fn write_safely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    // A link is followed, not replaced.
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        _ => path.to_owned(),
+    };
+    let dir = target.parent().filter(|d| !d.as_os_str().is_empty());
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    let temp = dir.map_or_else(
+        || PathBuf::from(format!(".{name}.csvedit-tmp")),
+        |d| d.join(format!(".{name}.csvedit-tmp")),
+    );
+    let written = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&temp, meta.permissions())?;
+        }
+        std::fs::rename(&temp, &target)
+    })();
+    match written {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            // A folder that takes no new file: write in place, as before.
+            if error.kind() == std::io::ErrorKind::PermissionDenied && target.exists() {
+                std::fs::write(&target, bytes)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+pub(crate) fn delimiter_name(delimiter: &str) -> String {
     match delimiter {
         "," => t!("delimiter-comma"),
         ";" => t!("delimiter-semicolon"),
         "\t" => t!("delimiter-tab"),
         "|" => t!("delimiter-pipe"),
-        "!#" => "Poliris".to_owned(),
+        "!#" => t!("delimiter-poliris"),
+        " " => t!("delimiter-space"),
         _ => t!("delimiter-other"),
     }
 }
 
 /// The delimiter itself, as shown next to its name.
-fn delimiter_glyph(delimiter: &str) -> String {
+pub(crate) fn delimiter_glyph(delimiter: &str) -> String {
     match delimiter {
         "\t" => "\u{21e5}".to_owned(),
         " " => "\u{2423}".to_owned(),
@@ -994,6 +1347,17 @@ pub fn encoding_name(encoding: Encoding) -> String {
         Encoding::Utf8 => "UTF-8".to_owned(),
         Encoding::Utf8Bom => t!("encoding-utf8-bom"),
         Encoding::Windows1252 => "Windows-1252".to_owned(),
+        Encoding::Utf16Le => "UTF-16 LE".to_owned(),
+        Encoding::Utf16Be => "UTF-16 BE".to_owned(),
+    }
+}
+
+/// "CRLF", "LF" or "CR".
+pub(crate) fn line_ending_name(ending: LineEnding) -> &'static str {
+    match ending {
+        LineEnding::Lf => "LF",
+        LineEnding::CrLf => "CRLF",
+        LineEnding::Cr => "CR",
     }
 }
 
@@ -1116,7 +1480,8 @@ AN-1052;House;Tresses;33370;5;128;468000;Contemporary house, pool, three bedroom
                 let (table, format) = table::parse(demo.as_bytes());
                 app.reset(table, format, Some(name.into()));
                 app.selected = if site { (2, 7) } else { (1, 3) };
-                app.format_changed = true;
+                app.format.line_ending = table::LineEnding::CrLf;
+                app.saved_format.line_ending = table::LineEnding::Lf;
                 match std::env::var("CSVEDIT_LABELS").as_deref() {
                     Ok("one") => columns::choose(columns::Labels::FromOne),
                     Ok("zero") => columns::choose(columns::Labels::FromZero),
