@@ -134,8 +134,13 @@ impl Table {
     /// value, text ignoring case, empty cells last), for `Edit::Reorder`.
     pub fn sort_order(&self, start: usize, col: usize, descending: bool) -> Vec<usize> {
         let rows = &self.rows[start..];
+        // 03/04/2026: the column's other dates tell which is the day.
+        let day_first = day_comes_first(rows.iter().map(|row| row[col].as_str()));
         // Each cell's key is worked out once, not at every comparison.
-        let keys: Vec<SortKey> = rows.iter().map(|row| SortKey::of(&row[col])).collect();
+        let keys: Vec<SortKey> = rows
+            .iter()
+            .map(|row| SortKey::of(&row[col], day_first))
+            .collect();
         let mut order: Vec<usize> = (0..rows.len()).collect();
         order.sort_by(|&a, &b| {
             let ordering = keys[a]
@@ -152,15 +157,18 @@ impl Table {
 }
 
 /// How a cell sorts: numbers (with a decimal point or comma) by value,
-/// then text ignoring case, then empty cells.
+/// then dates and times in time order, then text ignoring case, then empty
+/// cells.
 enum SortKey {
     Number(f64),
+    /// Seconds from year 0, for comparing.
+    Date(i64),
     Text(String),
     Empty,
 }
 
 impl SortKey {
-    fn of(cell: &str) -> Self {
+    fn of(cell: &str, day_first: bool) -> Self {
         let cell = cell.trim();
         if cell.is_empty() {
             return SortKey::Empty;
@@ -170,9 +178,21 @@ impl SortKey {
         } else {
             cell.parse::<f64>().ok()
         };
-        match number.filter(|n| n.is_finite()) {
-            Some(n) => SortKey::Number(n),
+        if let Some(n) = number.filter(|n| n.is_finite()) {
+            return SortKey::Number(n);
+        }
+        match parse_date(cell, day_first) {
+            Some(date) => SortKey::Date(date),
             None => SortKey::Text(cell.to_lowercase()),
+        }
+    }
+
+    fn rank(&self) -> u8 {
+        match self {
+            SortKey::Number(_) => 0,
+            SortKey::Date(_) => 1,
+            SortKey::Text(_) => 2,
+            SortKey::Empty => 3,
         }
     }
 
@@ -180,12 +200,116 @@ impl SortKey {
         use SortKey::*;
         match (self, other) {
             (Number(a), Number(b)) => a.total_cmp(b),
+            (Date(a), Date(b)) => a.cmp(b),
             (Text(a), Text(b)) => a.cmp(b),
-            (Empty, Empty) => Ordering::Equal,
-            (Number(_), _) | (Text(_), Empty) => Ordering::Less,
-            (_, Number(_)) | (Empty, Text(_)) => Ordering::Greater,
+            _ => self.rank().cmp(&other.rank()),
         }
     }
+}
+
+/// Whether dates written with the year last (03/04/2026) put the day first,
+/// as in France, or the month, as in the United States: a first number
+/// above 12 says day first, a second one month first; day first if nothing
+/// tells.
+fn day_comes_first<'a>(cells: impl Iterator<Item = &'a str>) -> bool {
+    for cell in cells {
+        let date = cell.trim().split([' ', 'T']).next().unwrap_or("");
+        let parts: Vec<&str> = date.split(['/', '-', '.']).collect();
+        if parts.len() != 3 || parts[0].len() > 2 {
+            continue;
+        }
+        let (Ok(a), Ok(b)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) else {
+            continue;
+        };
+        if a > 12 && b <= 12 {
+            return true;
+        }
+        if b > 12 && a <= 12 {
+            return false;
+        }
+    }
+    true
+}
+
+/// A date, a time, or a date and a time, as seconds from year 0:
+/// 2026-07-01, 01/07/2026, 1.7.26, with 17:32, 17:32:30, 17:32:30.5,
+/// 5:32 PM, after a space or a "T".
+fn parse_date(cell: &str, day_first: bool) -> Option<i64> {
+    let mut words = cell.split([' ', 'T']).filter(|w| !w.is_empty());
+    let first = words.next()?;
+    let (date, time) = if first.contains(':') {
+        (None, Some(first))
+    } else {
+        (Some(first), words.next())
+    };
+    // "PM" after the time.
+    let pm = match words.next().map(str::to_ascii_lowercase).as_deref() {
+        None => None,
+        Some("am") => Some(false),
+        Some("pm") => Some(true),
+        Some(_) => return None,
+    };
+    if words.next().is_some() {
+        return None;
+    }
+    let days = match date {
+        Some(date) => {
+            let parts: Vec<&str> = date.split(['/', '-', '.']).collect();
+            let [a, b, c] = parts.as_slice() else {
+                return None;
+            };
+            let number = |s: &str| {
+                s.parse::<u32>()
+                    .ok()
+                    .filter(|_| s.bytes().all(|b| b.is_ascii_digit()))
+            };
+            let (year, month, day) = if a.len() == 4 {
+                (number(a)?, number(b)?, number(c)?)
+            } else if c.len() == 4 || c.len() == 2 {
+                let year = number(c)?;
+                let year = if c.len() == 2 { 2000 + year } else { year };
+                let (a, b) = (number(a)?, number(b)?);
+                if day_first {
+                    (year, b, a)
+                } else {
+                    (year, a, b)
+                }
+            } else {
+                return None;
+            };
+            if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+                return None;
+            }
+            (i64::from(year) * 12 + i64::from(month)) * 31 + i64::from(day)
+        }
+        None => 0,
+    };
+    let seconds = match time {
+        Some(time) => {
+            let mut parts = time.split(':');
+            let hours: u32 = parts.next()?.parse().ok()?;
+            let minutes: u32 = parts.next()?.parse().ok()?;
+            let seconds: f64 = match parts.next() {
+                Some(s) => s.parse().ok()?,
+                None => 0.0,
+            };
+            if parts.next().is_some() || minutes > 59 || !(0.0..61.0).contains(&seconds) {
+                return None;
+            }
+            let hours = match pm {
+                Some(pm) if (1..=12).contains(&hours) => hours % 12 + if pm { 12 } else { 0 },
+                Some(_) => return None,
+                None => hours,
+            };
+            if hours > 23 {
+                return None;
+            }
+            i64::from(hours * 3600 + minutes * 60) + seconds as i64
+        }
+        None if pm.is_some() => return None,
+        None => 0,
+    };
+    Some(days * 86_400 + seconds)
 }
 
 /// A change to the table. Applying one gives back its inverse (see
@@ -1093,6 +1217,54 @@ mod tests {
         t.apply(Edit::Reorder(1, order));
         let column: Vec<_> = t.rows().iter().map(|r| r[0].as_str()).collect();
         assert_eq!(column, ["h", "1,5", "2", "10", "A", "b", ""]);
+    }
+
+    #[test]
+    fn sorts_dates_and_times() {
+        let column = |t: &Table| -> Vec<String> { t.rows().iter().map(|r| r[0].clone()).collect() };
+        let mut t = table(&[
+            &["create_time"],
+            &["01/07/2026 17:55:46"],
+            &["01/07/2026 01:33:44"],
+            &["13/06/2026 09:00:00"],
+            &["01/07/2026 17:32:30"],
+            &["02/01/2027"],
+            &[""],
+        ]);
+        let order = t.sort_order(1, 0, false);
+        t.apply(Edit::Reorder(1, order));
+        assert_eq!(
+            column(&t),
+            [
+                "create_time",
+                "13/06/2026 09:00:00",
+                "01/07/2026 01:33:44",
+                "01/07/2026 17:32:30",
+                "01/07/2026 17:55:46",
+                "02/01/2027",
+                ""
+            ]
+        );
+        // Month first when a day above 12 says so; ISO dates and times.
+        let mut t = table(&[&["07/13/2026"], &["07/01/2026"], &["12/31/2025 11:59 PM"]]);
+        let order = t.sort_order(0, 0, false);
+        t.apply(Edit::Reorder(0, order));
+        assert_eq!(
+            column(&t),
+            ["12/31/2025 11:59 PM", "07/01/2026", "07/13/2026"]
+        );
+        let mut t = table(&[
+            &["2026-07-01T17:32:30"],
+            &["2026-07-01T08:05"],
+            &["17:00"],
+            &["9:30"],
+        ]);
+        let order = t.sort_order(0, 0, true);
+        t.apply(Edit::Reorder(0, order));
+        assert_eq!(
+            column(&t),
+            ["2026-07-01T17:32:30", "2026-07-01T08:05", "17:00", "9:30"]
+        );
     }
 
     #[test]

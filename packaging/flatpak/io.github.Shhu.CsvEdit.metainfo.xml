@@ -44,6 +44,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.1.2" date="2026-11-08">
+      <description>
+        <p>Sorting puts dates and times in time order (01/07/2026 17:32:30, 2026-07-01, 5:32 PM…), after numbers and before text.</p>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-11-08">
       <description>
         <p>Fixes from a full review: the grid scrolls sideways, safer saving (files kept whole on failure, asks before losing lines left out at import), files written back exactly as read (quoting, delimiters, line endings, lines skipped at the top), UTF-16 files, Excel's sep= line, faster import and search on large files, keyboard fixes, and the third-party licenses in the About window.</p>

@@ -15,7 +15,8 @@ A simple CSV editor, in English and French. Written in Rust with
   Saving writes a new file and then replaces the old one, so a failure
   halfway leaves it whole; if reading left something out (blank lines,
   trimmed spaces, unreadable bytes), saving over the file asks first.
-- Edit cells, insert and delete rows and columns, sort, find (matches light
+- Edit cells, insert and delete rows and columns, sort (numbers by value,
+  dates and times in time order, text ignoring case), find (matches light
   up, Enter goes to the next one), undo and redo, copy and paste with
   spreadsheets.
 - An inspector shows the selected cell's whole text, its `<BR>` tags as
