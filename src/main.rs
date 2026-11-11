@@ -2,10 +2,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cancel;
 mod columns;
 mod config;
+mod diag;
 mod i18n;
 mod import;
+mod save;
 mod table;
 mod theme;
 mod workbook;
@@ -20,6 +23,8 @@ fn main() -> eframe::Result {
     if args.get(1).is_some_and(|a| a == workbook::READER_ARG) {
         std::process::exit(workbook::reader_main(&args[2..]));
     }
+    diag::start();
+    diag::install_panic_hook();
     i18n::init();
     columns::init();
     // Absolute: dialogs open in its folder, and saving doesn't depend on

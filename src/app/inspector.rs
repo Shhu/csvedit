@@ -136,7 +136,7 @@ impl CsvApp {
                 (words, t!("inspector-words", count = words)),
                 (brs, t!("inspector-brs", count = brs)),
             ] {
-                stat_card(ui, card, &value.to_string(), &label);
+                stat_card(ui, card, &crate::i18n::number(value as u64), &label);
             }
         });
         ui.add_space(14.0);
@@ -181,8 +181,14 @@ impl CsvApp {
         )));
         let stats = self.column_stats(col);
         for (label, value) in [
-            (t!("inspector-values"), stats.filled.to_string()),
-            (t!("inspector-empty"), stats.empty.to_string()),
+            (
+                t!("inspector-values"),
+                crate::i18n::number(stats.filled as u64),
+            ),
+            (
+                t!("inspector-empty"),
+                crate::i18n::number(stats.empty as u64),
+            ),
             (
                 t!("inspector-longest"),
                 t!("inspector-longest-value", count = stats.longest),
@@ -238,33 +244,42 @@ impl CsvApp {
 
     /// Characters (as seen on screen), words and `<BR>` tags of the text
     /// shown in the inspector.
-    fn cell_counts(&mut self, editing: bool) -> (usize, usize, usize) {
+    fn cell_counts(&mut self, editing: bool) -> Counts {
         let (row, col) = self.selected;
+        if editing && let Some(text) = &self.editing {
+            // Typed text: counted again only when it changed.
+            if let Some((seen, counts)) = &self.editing_counts
+                && seen == text
+            {
+                return *counts;
+            }
+            let counts = counts(text);
+            self.editing_counts = Some((text.clone(), counts));
+            return counts;
+        }
+        self.editing_counts = None;
         let key = (self.generation, row, col);
-        if !editing
-            && let Some((k, counts)) = self.cell_counts
+        if let Some((k, counts)) = self.cell_counts
             && k == key
         {
             return counts;
         }
-        let text = self
-            .editing
-            .as_deref()
-            .filter(|_| editing)
-            .unwrap_or(self.table.cell(row, col));
-        let parts = split_breaks(text);
-        let brs = parts.iter().filter(|(_, br)| *br).count();
-        let chars = parts.iter().map(|(s, _)| grapheme_count(s)).sum();
-        let words = parts
-            .iter()
-            .map(|(s, _)| s.split_whitespace().count())
-            .sum();
-        let counts = (chars, words, brs);
-        if !editing {
-            self.cell_counts = Some((key, counts));
-        }
+        let counts = counts(self.table.cell(row, col));
+        self.cell_counts = Some((key, counts));
         counts
     }
+}
+
+/// Characters (as seen on screen), words and `<BR>` tags of `text`.
+fn counts(text: &str) -> Counts {
+    let parts = split_breaks(text);
+    let brs = parts.iter().filter(|(_, br)| *br).count();
+    let chars = parts.iter().map(|(s, _)| grapheme_count(s)).sum();
+    let words = parts
+        .iter()
+        .map(|(s, _)| s.split_whitespace().count())
+        .sum();
+    (chars, words, brs)
 }
 
 /// A cell's text for the inspector: wrapped, each `<BR>` tag shown as a

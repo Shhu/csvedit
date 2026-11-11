@@ -1,13 +1,24 @@
 //! The table being edited, how it was written on disk (delimiter, encoding,
 //! line endings), and the undoable edits made to it.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+/// A cell's text. Up to 24 bytes are kept inline, without an allocation of
+/// their own: most cells of a large file fit, which halves its memory.
+pub type Cell = compact_str::CompactString;
 
 /// A rectangular grid of text cells: every row has the same number of
 /// columns, and there is always at least one row and one column.
+///
+/// A clone shares the cells: it is a snapshot (for saving away from the
+/// interface's thread), and the first edit made while one is kept copies
+/// them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
-    rows: Vec<Vec<String>>,
+    rows: Arc<Vec<Vec<Cell>>>,
 }
 
 impl Default for Table {
@@ -19,23 +30,25 @@ impl Default for Table {
 impl Table {
     pub fn empty(rows: usize, cols: usize) -> Self {
         Self {
-            rows: vec![vec![String::new(); cols.max(1)]; rows.max(1)],
+            rows: Arc::new(vec![vec![Cell::default(); cols.max(1)]; rows.max(1)]),
         }
     }
 
     /// Ragged rows are padded with empty cells.
-    pub fn from_rows(mut rows: Vec<Vec<String>>) -> Self {
+    pub fn from_rows(mut rows: Vec<Vec<Cell>>) -> Self {
         let cols = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
         if rows.is_empty() {
             rows.push(Vec::new());
         }
         for row in &mut rows {
-            row.resize(cols, String::new());
+            row.resize(cols, Cell::default());
         }
-        Self { rows }
+        Self {
+            rows: Arc::new(rows),
+        }
     }
 
-    pub fn rows(&self) -> &[Vec<String>] {
+    pub fn rows(&self) -> &[Vec<Cell>] {
         &self.rows
     }
 
@@ -47,33 +60,67 @@ impl Table {
         self.rows[0].len()
     }
 
+    /// The distinct non-ASCII characters of the cells, in order.
+    pub fn rare_chars(&self) -> String {
+        let chars: std::collections::BTreeSet<char> = self
+            .rows
+            .iter()
+            .flatten()
+            .filter(|cell| !cell.is_ascii())
+            .flat_map(|cell| cell.chars())
+            .filter(|c| !c.is_ascii())
+            .collect();
+        chars.into_iter().collect()
+    }
+
     pub fn cell(&self, row: usize, col: usize) -> &str {
         &self.rows[row][col]
     }
 
     /// Applies `edit` and returns the edit that undoes it.
     pub fn apply(&mut self, edit: Edit) -> Edit {
+        if let Edit::Batch(edits) = edit {
+            let mut inverses: Vec<_> = edits.into_iter().map(|e| self.apply(e)).collect();
+            inverses.reverse();
+            return Edit::Batch(inverses);
+        }
+        // Copies the cells only when a snapshot still shares them.
+        let table = Arc::make_mut(&mut self.rows);
         match edit {
             Edit::SetCells(cells) => {
                 let mut old: Vec<_> = cells
                     .into_iter()
                     .map(|(row, col, text)| {
-                        let old = std::mem::replace(&mut self.rows[row][col], text);
+                        let old = std::mem::replace(&mut table[row][col], text);
                         (row, col, old)
                     })
                     .collect();
                 old.reverse();
                 Edit::SetCells(old)
             }
+            Edit::SetBlock(top, cols, values) => {
+                let old = values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, line)| {
+                        let row = &mut table[top + i];
+                        line.into_iter()
+                            .zip(&cols)
+                            .map(|(text, &col)| std::mem::replace(&mut row[col], text))
+                            .collect()
+                    })
+                    .collect();
+                Edit::SetBlock(top, cols, old)
+            }
             Edit::InsertRows(at, rows) => {
                 let count = rows.len();
-                self.rows.splice(at..at, rows);
+                table.splice(at..at, rows);
                 Edit::RemoveRows(at, count)
             }
             Edit::RemoveRows(at, count) => {
-                let removed: Vec<_> = self.rows.drain(at..at + count).collect();
-                if self.rows.is_empty() {
-                    self.rows.push(vec![String::new(); removed[0].len()]);
+                let removed: Vec<_> = table.drain(at..at + count).collect();
+                if table.is_empty() {
+                    table.push(vec![Cell::default(); removed[0].len()]);
                     // Undo puts back the removed rows, then drops the blank one.
                     let count = removed.len();
                     return Edit::Batch(vec![
@@ -85,21 +132,30 @@ impl Table {
             }
             Edit::InsertCols(at, cols) => {
                 let count = cols.len();
-                for (r, row) in self.rows.iter_mut().enumerate() {
-                    row.splice(at..at, cols.iter().map(|col| col[r].clone()));
+                // Each column gives its cells in order, one per row: they
+                // are moved, not copied, and the rows grow by exactly
+                // `count` (splice alone would double their room).
+                let mut cols: Vec<_> = cols.into_iter().map(Vec::into_iter).collect();
+                for row in table.iter_mut() {
+                    row.reserve_exact(count);
+                    row.splice(
+                        at..at,
+                        cols.iter_mut()
+                            .map(|col| col.next().expect("a cell per row")),
+                    );
                 }
                 Edit::RemoveCols(at, count)
             }
             Edit::RemoveCols(at, count) => {
-                let mut removed = vec![Vec::with_capacity(self.rows.len()); count];
-                for row in &mut self.rows {
+                let mut removed = vec![Vec::with_capacity(table.len()); count];
+                for row in table.iter_mut() {
                     for (i, text) in row.drain(at..at + count).enumerate() {
                         removed[i].push(text);
                     }
                 }
-                if self.col_count() == 0 {
-                    for row in &mut self.rows {
-                        row.push(String::new());
+                if table[0].is_empty() {
+                    for row in table.iter_mut() {
+                        row.push(Cell::default());
                     }
                     return Edit::Batch(vec![
                         Edit::InsertCols(0, removed),
@@ -109,30 +165,35 @@ impl Table {
                 Edit::InsertCols(at, removed)
             }
             Edit::Reorder(start, order) => {
-                let mut taken: Vec<Option<Vec<String>>> = self.rows[start..start + order.len()]
-                    .iter_mut()
-                    .map(|row| Some(std::mem::take(row)))
-                    .collect();
-                for (i, &from) in order.iter().enumerate() {
-                    self.rows[start + i] = taken[from].take().expect("a permutation");
+                // Moved in place, one cycle of the permutation at a time.
+                let rows = &mut table[start..start + order.len()];
+                let mut done = vec![false; order.len()];
+                for first in 0..order.len() {
+                    if done[first] {
+                        continue;
+                    }
+                    let held = std::mem::take(&mut rows[first]);
+                    let mut i = first;
+                    loop {
+                        done[i] = true;
+                        let from = order[i] as usize;
+                        if from == first {
+                            rows[i] = held;
+                            break;
+                        }
+                        rows[i] = std::mem::take(&mut rows[from]);
+                        i = from;
+                    }
                 }
-                let mut inverse = vec![0; order.len()];
-                for (i, &from) in order.iter().enumerate() {
-                    inverse[from] = i;
-                }
-                Edit::Reorder(start, inverse)
+                Edit::Reorder(start, invert(&order))
             }
-            Edit::Batch(edits) => {
-                let mut inverses: Vec<_> = edits.into_iter().map(|e| self.apply(e)).collect();
-                inverses.reverse();
-                Edit::Batch(inverses)
-            }
+            Edit::Batch(_) => unreachable!("handled above"),
         }
     }
 
     /// The order that sorts rows `start..` on column `col` (numbers by
     /// value, text ignoring case, empty cells last), for `Edit::Reorder`.
-    pub fn sort_order(&self, start: usize, col: usize, descending: bool) -> Vec<usize> {
+    pub fn sort_order(&self, start: usize, col: usize, descending: bool) -> Vec<u32> {
         let rows = &self.rows[start..];
         // 03/04/2026: the column's other dates tell which is the day.
         let day_first = day_comes_first(rows.iter().map(|row| row[col].as_str()));
@@ -141,8 +202,10 @@ impl Table {
             .iter()
             .map(|row| SortKey::of(&row[col], day_first))
             .collect();
-        let mut order: Vec<usize> = (0..rows.len()).collect();
+        let count = u32::try_from(rows.len()).expect("fewer rows than MAX_CELLS");
+        let mut order: Vec<u32> = (0..count).collect();
         order.sort_by(|&a, &b| {
+            let (a, b) = (a as usize, b as usize);
             let ordering = keys[a]
                 .cmp(&keys[b])
                 .then_with(|| rows[a][col].cmp(&rows[b][col]));
@@ -163,7 +226,8 @@ enum SortKey {
     Number(f64),
     /// Seconds from year 0, for comparing.
     Date(i64),
-    Text(String),
+    /// Lowercased: kept inline when short, like the cells.
+    Text(Cell),
     Empty,
 }
 
@@ -183,7 +247,12 @@ impl SortKey {
         }
         match parse_date(cell, day_first) {
             Some(date) => SortKey::Date(date),
-            None => SortKey::Text(cell.to_lowercase()),
+            None if cell.is_ascii() => {
+                let mut key = Cell::from(cell);
+                key.as_mut_str().make_ascii_lowercase();
+                SortKey::Text(key)
+            }
+            None => SortKey::Text(Cell::from(cell).to_lowercase()),
         }
     }
 
@@ -317,17 +386,68 @@ fn parse_date(cell: &str, day_first: bool) -> Option<i64> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Edit {
     /// (row, column, new text)
-    SetCells(Vec<(usize, usize, String)>),
+    SetCells(Vec<(usize, usize, Cell)>),
+    /// A block of cells from row `top` on, as pasted: row `top + i` takes
+    /// `values[i][j]` in column `cols[j]` (a shorter line leaves the last
+    /// columns as they are). No coordinates are kept per cell.
+    SetBlock(usize, Vec<usize>, Vec<Vec<Cell>>),
     /// Rows inserted before row `at`.
-    InsertRows(usize, Vec<Vec<String>>),
+    InsertRows(usize, Vec<Vec<Cell>>),
     RemoveRows(usize, usize),
     /// Columns (each a cell per row) inserted before column `at`.
-    InsertCols(usize, Vec<Vec<String>>),
+    InsertCols(usize, Vec<Vec<Cell>>),
     RemoveCols(usize, usize),
     /// Rows from `start` on take the order given: row `start + i` becomes
-    /// the old row `start + order[i]`.
-    Reorder(usize, Vec<usize>),
+    /// the old row `start + order[i]`. `u32` halves what the undo steps
+    /// keep: a table holds far fewer rows (`MAX_CELLS`).
+    Reorder(usize, Vec<u32>),
     Batch(Vec<Edit>),
+}
+
+/// The permutation that undoes `order`: `invert(order)[order[i]] == i`.
+pub fn invert(order: &[u32]) -> Vec<u32> {
+    let mut inverse = vec![0; order.len()];
+    for (i, &from) in order.iter().enumerate() {
+        inverse[from as usize] = i as u32;
+    }
+    inverse
+}
+
+/// Estimated bytes a cell takes: its own, and its text's allocation past
+/// 24 bytes.
+pub fn cell_bytes(cell: &Cell) -> u64 {
+    (std::mem::size_of::<Cell>()
+        + if cell.is_heap_allocated() {
+            cell.capacity()
+        } else {
+            0
+        }) as u64
+}
+
+/// Estimated bytes a row takes, with the room it keeps for more cells.
+pub fn row_bytes(row: &Vec<Cell>) -> u64 {
+    (std::mem::size_of::<Vec<Cell>>()
+        + row.capacity().saturating_sub(row.len()) * std::mem::size_of::<Cell>()) as u64
+        + row.iter().map(cell_bytes).sum::<u64>()
+}
+
+impl Edit {
+    /// Estimated bytes the edit keeps (for the undo steps' budget).
+    pub fn bytes(&self) -> u64 {
+        let own = std::mem::size_of::<Edit>() as u64;
+        own + match self {
+            Edit::SetCells(cells) => cells.iter().map(|(_, _, s)| 16 + cell_bytes(s)).sum(),
+            Edit::SetBlock(_, cols, values) => {
+                cols.len() as u64 * 8 + values.iter().map(row_bytes).sum::<u64>()
+            }
+            Edit::InsertRows(_, rows) | Edit::InsertCols(_, rows) => {
+                rows.iter().map(row_bytes).sum()
+            }
+            Edit::Reorder(_, order) => order.len() as u64 * 4,
+            Edit::Batch(edits) => edits.iter().map(Edit::bytes).sum(),
+            Edit::RemoveRows(..) | Edit::RemoveCols(..) => 0,
+        }
+    }
 }
 
 /// Files with more cells than this are refused: each cell takes memory of
@@ -517,6 +637,9 @@ pub struct Imported {
     pub formulas: Vec<(usize, usize, String)>,
     /// A workbook's sheets.
     pub sheets: Vec<String>,
+    /// The cells' distinct non-ASCII characters (filled in by the import
+    /// window's reading), for `theme::cover`.
+    pub rare_chars: String,
 }
 
 /// The file has too many cells to be opened.
@@ -537,13 +660,46 @@ pub fn parse(bytes: &[u8]) -> (Table, Format) {
 /// Reads a CSV file's bytes the way `options` say. It is written back
 /// with the delimiter that split the most fields, its quotes and its line
 /// endings.
+#[cfg(test)]
 pub fn import(bytes: &[u8], options: &ImportOptions) -> Result<Imported, TooLarge> {
+    import_until(bytes, options, &AtomicBool::new(false)).map_err(|stop| match stop {
+        Stop::TooLarge(too_large) => too_large,
+        Stop::Cancelled => unreachable!("never cancelled"),
+    })
+}
+
+/// Why `import_until` gave up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    TooLarge(TooLarge),
+    /// `cancel` was set.
+    Cancelled,
+}
+
+/// `import`, given up as soon as the file proves too large or `cancel`
+/// is set.
+pub fn import_until(
+    bytes: &[u8],
+    options: &ImportOptions,
+    cancel: &AtomicBool,
+) -> Result<Imported, Stop> {
     let decoded = decode_as(bytes, options.encoding);
-    let parsed = split_fields(&decoded.text, options, usize::MAX);
+    if cancel.load(AtomicOrdering::Relaxed) {
+        return Err(Stop::Cancelled);
+    }
+    let limits = Limits {
+        max_rows: usize::MAX,
+        max_cells: MAX_CELLS,
+        lines: false,
+        cancel: Some(cancel),
+    };
+    let parsed = split_with(&decoded.text, options, &limits)?;
+    let invalid_bytes = decoded.invalid;
+    drop(decoded);
     let rows = parsed.rows.len();
     let cols = parsed.rows.iter().map(Vec::len).max().unwrap_or(0);
     if rows.saturating_mul(cols) > MAX_CELLS {
-        return Err(TooLarge { rows, cols });
+        return Err(Stop::TooLarge(TooLarge { rows, cols }));
     }
     let delimiter = parsed
         .main_delimiter
@@ -570,7 +726,7 @@ pub fn import(bytes: &[u8], options: &ImportOptions) -> Result<Imported, TooLarg
     let losses = Losses {
         blank_lines: parsed.blank_lines,
         trimmed: parsed.trimmed,
-        invalid_bytes: decoded.invalid,
+        invalid_bytes,
     };
     Ok(Imported {
         table: Table::from_rows(parsed.rows),
@@ -578,13 +734,14 @@ pub fn import(bytes: &[u8], options: &ImportOptions) -> Result<Imported, TooLarg
         losses,
         formulas: Vec::new(),
         sheets: Vec::new(),
+        rare_chars: String::new(),
     })
 }
 
 /// The first rows of a file, read the way `options` say, for the import
 /// window: only the start of the file is read.
 pub struct Preview {
-    pub rows: Vec<Vec<String>>,
+    pub rows: Vec<Vec<Cell>>,
     /// The line of the file each row starts on, counted from 1.
     pub lines: Vec<usize>,
     pub invalid_bytes: usize,
@@ -604,19 +761,20 @@ pub fn preview(bytes: &[u8], options: &ImportOptions, max_rows: usize) -> Previe
 }
 
 /// A file's text, and how many byte sequences the encoding couldn't read.
-pub struct Decoded {
-    pub text: String,
+pub struct Decoded<'a> {
+    /// Borrowed from the bytes when they are already valid UTF-8.
+    pub text: Cow<'a, str>,
     pub invalid: usize,
 }
 
 /// The text of a file in `encoding` (byte order marks are left out).
-pub fn decode_as(bytes: &[u8], encoding: Encoding) -> Decoded {
+pub fn decode_as(bytes: &[u8], encoding: Encoding) -> Decoded<'_> {
     match encoding {
         Encoding::Utf8 | Encoding::Utf8Bom => {
             let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
             if let Ok(text) = std::str::from_utf8(bytes) {
                 return Decoded {
-                    text: text.to_owned(),
+                    text: Cow::Borrowed(text),
                     invalid: 0,
                 };
             }
@@ -629,13 +787,15 @@ pub fn decode_as(bytes: &[u8], encoding: Encoding) -> Decoded {
                     invalid += 1;
                 }
             }
-            Decoded { text, invalid }
+            Decoded {
+                text: Cow::Owned(text),
+                invalid,
+            }
         }
         Encoding::Windows1252 => Decoded {
             text: encoding_rs::WINDOWS_1252
                 .decode_without_bom_handling(bytes)
-                .0
-                .into_owned(),
+                .0,
             invalid: 0,
         },
         Encoding::Utf16Le | Encoding::Utf16Be => {
@@ -653,11 +813,15 @@ pub fn decode_as(bytes: &[u8], encoding: Encoding) -> Decoded {
                 } else {
                     0
                 },
-                text: text.into_owned(),
+                text,
             }
         }
     }
 }
+
+/// Non-ASCII characters and invalid sequences looked at, at most, to tell
+/// UTF-8 from Windows-1252.
+const ENCODING_EVIDENCE: usize = 10_000;
 
 /// The encoding a file seems to be in: its byte order mark, else UTF-16
 /// by its zero bytes, else UTF-8 when most of its non-ASCII text reads as
@@ -696,11 +860,16 @@ pub fn detect_encoding(bytes: &[u8]) -> Encoding {
         return Encoding::Utf8;
     }
     // A few stray bytes in a UTF-8 file shouldn't turn all of it into
-    // Windows-1252.
+    // Windows-1252. The first non-ASCII characters are enough to tell: a
+    // large file isn't walked to its end.
     let (mut valid, mut invalid) = (0usize, 0usize);
     for chunk in bytes.utf8_chunks() {
-        valid += chunk.valid().chars().filter(|c| !c.is_ascii()).count();
+        // Each non-ASCII character starts with a byte 11xxxxxx.
+        valid += chunk.valid().bytes().filter(|b| *b >= 0xC0).count();
         invalid += usize::from(!chunk.invalid().is_empty());
+        if valid + invalid >= ENCODING_EVIDENCE {
+            break;
+        }
     }
     if valid > invalid {
         Encoding::Utf8
@@ -711,12 +880,12 @@ pub fn detect_encoding(bytes: &[u8]) -> Encoding {
 
 /// The first `max_rows` rows of `text`. Blank lines are left out.
 #[cfg(test)]
-pub fn split(text: &str, options: &ImportOptions, max_rows: usize) -> Vec<Vec<String>> {
+pub fn split(text: &str, options: &ImportOptions, max_rows: usize) -> Vec<Vec<Cell>> {
     split_fields(text, options, max_rows).rows
 }
 
 struct Parsed {
-    rows: Vec<Vec<String>>,
+    rows: Vec<Vec<Cell>>,
     /// The line of the text each row starts on, counted from 1.
     lines: Vec<usize>,
     /// Every field was between quotes.
@@ -744,7 +913,77 @@ fn line_break_len(text: &str) -> Option<usize> {
     }
 }
 
+/// When `split_with` stops reading.
+struct Limits<'a> {
+    max_rows: usize,
+    /// Rows × columns past which the file is refused.
+    max_cells: usize,
+    /// `Parsed::lines` is filled in.
+    lines: bool,
+    /// Looked at every `CANCEL_EVERY` rows.
+    cancel: Option<&'a AtomicBool>,
+}
+
+/// Rows read between two looks at the cancel flag.
+const CANCEL_EVERY: usize = 4096;
+
+/// The first `max_rows` rows of `text`, with no other limit.
 fn split_fields(text: &str, options: &ImportOptions, max_rows: usize) -> Parsed {
+    let limits = Limits {
+        max_rows,
+        max_cells: usize::MAX,
+        lines: true,
+        cancel: None,
+    };
+    match split_with(text, options, &limits) {
+        Ok(parsed) => parsed,
+        Err(_) => unreachable!("nothing stops a reading without limits"),
+    }
+}
+
+/// Length of the UTF-8 character starting with byte `lead`.
+fn char_len(lead: u8) -> usize {
+    match lead {
+        0x00..0x80 => 1,
+        0x80..0xE0 => 2,
+        0xE0..0xF0 => 3,
+        _ => 4,
+    }
+}
+
+/// A field's text: what `field` holds (the parts of a quoted field already
+/// copied), then `tail`, straight from the file.
+fn take_field(
+    field: &mut String,
+    tail: &str,
+    quoted: bool,
+    trim: bool,
+    trimmed: &mut usize,
+) -> Cell {
+    let mut text = if field.is_empty() {
+        tail
+    } else {
+        field.push_str(tail);
+        field.as_str()
+    };
+    if trim && !quoted {
+        let kept = text.trim();
+        if kept.len() != text.len() {
+            *trimmed += 1;
+            text = kept;
+        }
+    }
+    // A short cell is copied inline, with no allocation; the buffer is
+    // kept for the next quoted field.
+    let cell = Cell::new(text);
+    field.clear();
+    cell
+}
+
+/// Splits `text` into rows of fields. Unquoted fields are copied straight
+/// from `text`; the text is walked byte by byte, stopping only at bytes
+/// that may start a delimiter, a quote or a line break.
+fn split_with(text: &str, options: &ImportOptions, limits: &Limits) -> Result<Parsed, Stop> {
     // The skipped lines end where the parser's lines do: at CRLF, LF or CR.
     let mut start = 0;
     for _ in 0..options.skip_lines {
@@ -758,6 +997,8 @@ fn split_fields(text: &str, options: &ImportOptions, max_rows: usize) -> Parsed 
     }
     let preamble = text[..start].to_owned();
     let rest = &text[start..];
+    let bytes = rest.as_bytes();
+    let n = bytes.len();
 
     // Longest first, so that `!#` wins over `!`.
     let mut delimiters: Vec<&str> = options
@@ -768,7 +1009,28 @@ fn split_fields(text: &str, options: &ImportOptions, max_rows: usize) -> Parsed 
         .collect();
     delimiters.sort_by_key(|d| std::cmp::Reverse(d.len()));
     let mut uses = vec![0usize; delimiters.len()];
-    let delimiter_at = |i: usize| delimiters.iter().position(|d| rest[i..].starts_with(*d));
+    let delimiter_at = |i: usize| {
+        delimiters
+            .iter()
+            .position(|d| bytes[i..].starts_with(d.as_bytes()))
+    };
+    let mut quote_buffer = [0u8; 4];
+    let quote: Option<&str> = options.quote.map(|q| &*q.encode_utf8(&mut quote_buffer));
+    // The bytes that may mean something: outside quotes, the first byte of
+    // each delimiter, of the quote and of line breaks; inside, the quote's
+    // and line breaks' (to count lines).
+    let mut special = [false; 256];
+    let mut special_quoted = [false; 256];
+    for table in [&mut special, &mut special_quoted] {
+        table[usize::from(b'\r')] = true;
+        table[usize::from(b'\n')] = true;
+        if let Some(q) = quote {
+            table[usize::from(q.as_bytes()[0])] = true;
+        }
+    }
+    for d in &delimiters {
+        special[usize::from(d.as_bytes()[0])] = true;
+    }
 
     let mut parsed = Parsed {
         rows: Vec::new(),
@@ -781,66 +1043,113 @@ fn split_fields(text: &str, options: &ImportOptions, max_rows: usize) -> Parsed 
         blank_lines: 0,
         trimmed: 0,
     };
-    let mut row: Vec<String> = Vec::new();
+    let mut row: Vec<Cell> = Vec::new();
+    // The parts of a quoted field already read (doubled quotes undone).
     let mut field = String::new();
+    // Where the part of the field not yet in `field` starts.
+    let mut run = 0;
     let mut quoted = false;
     let mut in_quotes = false;
     // A delimiter was the last thing read on this line.
     let mut after_delimiter = false;
     let mut unquoted_fields = 0;
     let mut trailing_rows = 0;
+    // The most fields a row had so far.
+    let mut widest = 0;
     // Line endings seen at the end of rows: LF, CRLF, CR.
     let mut endings = [0usize; 3];
     let mut line = options.skip_lines + 1;
     let mut row_line = line;
-    let mut end_field = |row: &mut Vec<String>, field: &mut String, quoted: &mut bool| {
-        let text = std::mem::take(field);
-        if !*quoted {
-            unquoted_fields += 1;
-        }
-        if options.trim && !*quoted {
-            let trimmed = text.trim();
-            if trimmed.len() != text.len() {
-                parsed.trimmed += 1;
-                row.push(trimmed.to_owned());
-                *quoted = false;
-                return;
+
+    // Ends the field at `end`; gives up once the rows read so far, padded
+    // to the widest, are sure to hold too many cells. (Each row may yet
+    // lose a trailing delimiter's empty field, hence one column less.)
+    macro_rules! end_field {
+        ($end:expr) => {{
+            if !quoted {
+                unquoted_fields += 1;
             }
-        }
-        row.push(text);
-        *quoted = false;
-    };
+            let cell = take_field(
+                &mut field,
+                &rest[run..$end],
+                quoted,
+                options.trim,
+                &mut parsed.trimmed,
+            );
+            row.push(cell);
+            let rows = parsed.rows.len() + 1;
+            let cols = widest.max(row.len());
+            if rows.saturating_mul(cols.saturating_sub(1).max(1)) > limits.max_cells {
+                return Err(Stop::TooLarge(TooLarge { rows, cols }));
+            }
+        }};
+    }
+
     let mut i = 0;
-    while let Some(c) = rest[i..].chars().next() {
-        let next = i + c.len_utf8();
+    while i < n {
         if in_quotes {
-            if Some(c) == options.quote {
-                if rest[next..].starts_with(c) {
-                    field.push(c);
-                    i = next + c.len_utf8();
-                    continue;
+            let q = quote.expect("quotes are opened with a quote");
+            let Some(j) = bytes[i..]
+                .iter()
+                .position(|&b| special_quoted[usize::from(b)])
+                .map(|j| i + j)
+            else {
+                break;
+            };
+            let b = bytes[j];
+            if bytes[j..].starts_with(q.as_bytes()) {
+                let after = j + q.len();
+                field.push_str(&rest[run..j]);
+                if bytes[after..].starts_with(q.as_bytes()) {
+                    // Doubled: one quote of the text.
+                    field.push_str(q);
+                    i = after + q.len();
+                } else {
+                    in_quotes = false;
+                    i = after;
                 }
-                in_quotes = false;
+                run = i;
+            } else if b == b'\n' || (b == b'\r' && bytes.get(j + 1) != Some(&b'\n')) {
+                line += 1;
+                i = j + 1;
             } else {
-                if c == '\n' || (c == '\r' && !rest[next..].starts_with('\n')) {
-                    line += 1;
-                }
-                field.push(c);
+                i = j + char_len(b);
             }
-            i = next;
-        } else if Some(c) == options.quote && !quoted && field.trim().is_empty() {
+            continue;
+        }
+        // Plain text up to the next byte that may mean something.
+        let j = bytes[i..]
+            .iter()
+            .position(|&b| special[usize::from(b)])
+            .map_or(n, |j| i + j);
+        if j > i {
+            after_delimiter = false;
+            i = j;
+            if i == n {
+                break;
+            }
+        }
+        let b = bytes[i];
+        if let Some(q) = quote
+            && !quoted
+            && bytes[i..].starts_with(q.as_bytes())
+            && rest[run..i].trim().is_empty()
+        {
             field.clear();
+            i += q.len();
+            run = i;
             in_quotes = true;
             quoted = true;
             after_delimiter = false;
-            i = next;
         } else if let Some(d) = delimiter_at(i) {
+            let end = i;
             i += delimiters[d].len();
             // Merged delimiters at the start of a line (aligned text) are
             // indentation, not an empty first field.
-            let leading = options.merge_delimiters && row.is_empty() && field.is_empty() && !quoted;
+            let leading = options.merge_delimiters && row.is_empty() && !quoted && run == end;
             if !leading {
-                end_field(&mut row, &mut field, &mut quoted);
+                end_field!(end);
+                quoted = false;
                 uses[d] += 1;
             }
             if options.merge_delimiters {
@@ -848,18 +1157,25 @@ fn split_fields(text: &str, options: &ImportOptions, max_rows: usize) -> Parsed 
                     i += delimiters[d].len();
                 }
             }
+            run = i;
             after_delimiter = !leading;
-        } else if c == '\r' || c == '\n' {
-            let len = line_break_len(&rest[i..]).expect("a line break");
+        } else if b == b'\r' || b == b'\n' {
+            let end = i;
+            let len = if bytes[i..].starts_with(b"\r\n") {
+                2
+            } else {
+                1
+            };
             i += len;
             line += 1;
-            if row.is_empty() && field.is_empty() && !quoted {
+            if row.is_empty() && !quoted && run == end {
                 parsed.blank_lines += 1;
                 row_line = line;
+                run = i;
                 continue;
             }
-            endings[match (c, len) {
-                ('\n', _) => 0,
+            endings[match (b, len) {
+                (b'\n', _) => 0,
                 (_, 2) => 1,
                 _ => 2,
             }] += 1;
@@ -867,30 +1183,45 @@ fn split_fields(text: &str, options: &ImportOptions, max_rows: usize) -> Parsed 
                 trailing_rows += 1;
             }
             after_delimiter = false;
-            end_field(&mut row, &mut field, &mut quoted);
+            end_field!(end);
+            quoted = false;
+            run = i;
             // The next row is likely as wide: room for it up front.
             let width = row.len();
+            widest = widest.max(width);
             parsed
                 .rows
                 .push(std::mem::replace(&mut row, Vec::with_capacity(width)));
-            parsed.lines.push(row_line);
+            if limits.lines {
+                parsed.lines.push(row_line);
+            }
             row_line = line;
-            if parsed.rows.len() == max_rows {
+            let rows = parsed.rows.len();
+            if rows == limits.max_rows {
                 break;
             }
+            if rows.is_multiple_of(CANCEL_EVERY)
+                && limits
+                    .cancel
+                    .is_some_and(|c| c.load(AtomicOrdering::Relaxed))
+            {
+                return Err(Stop::Cancelled);
+            }
         } else {
-            field.push(c);
+            // The start of a delimiter or quote that isn't one: text.
+            i += char_len(b);
             after_delimiter = false;
-            i = next;
         }
     }
-    if parsed.rows.len() < max_rows && (!row.is_empty() || !field.is_empty() || quoted) {
+    if parsed.rows.len() < limits.max_rows && (!row.is_empty() || run < n || quoted) {
         if after_delimiter {
             trailing_rows += 1;
         }
-        end_field(&mut row, &mut field, &mut quoted);
+        end_field!(n);
         parsed.rows.push(row);
-        parsed.lines.push(row_line);
+        if limits.lines {
+            parsed.lines.push(row_line);
+        }
     }
 
     let rows = parsed.rows.len();
@@ -923,7 +1254,7 @@ fn split_fields(text: &str, options: &ImportOptions, max_rows: usize) -> Parsed 
             (used, std::cmp::Reverse(rank))
         })
         .cloned();
-    parsed
+    Ok(parsed)
 }
 
 /// The delimiter that splits the first lines into the same number of
@@ -965,116 +1296,230 @@ pub struct Unencodable {
     pub cell: Option<(usize, usize)>,
 }
 
+/// What decides which cells go between quotes, worked out once per save.
+struct Quoting<'a> {
+    quote_all: bool,
+    quote: Option<char>,
+    /// The delimiter written and the others the file was read with.
+    delimiters: Vec<&'a [u8]>,
+    /// Bytes that start a delimiter (or need quotes by themselves).
+    starts: [bool; 256],
+}
+
+impl<'a> Quoting<'a> {
+    fn new(delimiter: &'a str, format: &'a Format) -> Self {
+        let delimiters: Vec<&[u8]> = std::iter::once(delimiter)
+            .chain(format.other_delimiters.iter().map(String::as_str))
+            .filter(|d| !d.is_empty())
+            .map(str::as_bytes)
+            .collect();
+        let mut starts = [false; 256];
+        starts[usize::from(b'\r')] = true;
+        starts[usize::from(b'\n')] = true;
+        if format.quote == Some('"') {
+            starts[usize::from(b'"')] = true;
+        }
+        for d in &delimiters {
+            starts[usize::from(d[0])] = true;
+        }
+        Self {
+            quote_all: format.quote_all,
+            quote: format.quote,
+            delimiters,
+            starts,
+        }
+    }
+}
+
 /// Whether `cell` must be written between quotes to read back the same.
-fn needs_quotes(cell: &str, alone: bool, format: &Format) -> bool {
-    if format.quote_all || cell.contains(['\r', '\n']) {
+fn needs_quotes(cell: &str, alone: bool, quoting: &Quoting) -> bool {
+    if quoting.quote_all {
         return true;
     }
     // A line with one empty field isn't a blank line.
     if alone && cell.is_empty() {
         return true;
     }
-    let delimiters = std::iter::once(&format.delimiter).chain(&format.other_delimiters);
-    for delimiter in delimiters.filter(|d| !d.is_empty()) {
-        if cell.contains(delimiter.as_str()) {
-            return true;
-        }
-        // The end of the cell and the delimiter after it can make up the
-        // delimiter earlier ("a!" then "!!" reads "a", "!…").
-        if delimiter.chars().any(|c| cell.ends_with(c))
-            && format!("{cell}{delimiter}").find(delimiter.as_str()) != Some(cell.len())
+    // One pass over the bytes: line breaks, double quotes (the reader
+    // takes a quote as one only at the start of a field; double quotes
+    // elsewhere are quoted too, as in files written by spreadsheets) and
+    // delimiters. A delimiter's first byte never falls inside a character.
+    let bytes = cell.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if quoting.starts[usize::from(b)]
+            && (matches!(b, b'\r' | b'\n')
+                || (b == b'"' && quoting.quote == Some('"'))
+                || quoting.delimiters.iter().any(|d| bytes[i..].starts_with(d)))
         {
             return true;
         }
     }
-    // The reader takes a quote as one only at the start of a field; double
-    // quotes elsewhere are quoted too, as in files written by spreadsheets.
-    match format.quote {
-        Some('"') => cell.contains('"'),
+    // The end of the cell and the delimiter after it can make up the
+    // delimiter earlier ("a!" then "!!" reads "a", "!…").
+    for d in &quoting.delimiters {
+        if (1..d.len()).any(|k| bytes.ends_with(&d[..k]) && d[k..] == d[..d.len() - k]) {
+            return true;
+        }
+    }
+    match quoting.quote {
+        Some('"') => false,
         Some(quote) => cell.trim_start().starts_with(quote),
         None => cell.trim_start().starts_with('"'),
     }
 }
 
-pub fn write(table: &Table, format: &Format) -> Result<Vec<u8>, Unencodable> {
-    let delimiter = if format.delimiter.is_empty() {
-        ","
-    } else {
-        format.delimiter.as_str()
-    };
-    // A file without quoting gets double quotes where they can't be done
-    // without: the usual ones, which a reader expects.
-    let quote = format.quote.unwrap_or('"');
-    let doubled = format!("{quote}{quote}");
-    let newline = format.line_ending.as_str();
-    let size: usize = table
-        .rows()
-        .iter()
-        .map(|row| row.iter().map(|c| c.len() + delimiter.len()).sum::<usize>() + 2)
-        .sum();
-    let mut text = String::with_capacity(format.preamble.len() + size + size / 8);
-    text.push_str(&format.preamble);
-    for row in table.rows() {
-        for (i, cell) in row.iter().enumerate() {
-            if i > 0 {
-                text.push_str(delimiter);
-            }
-            let protected;
-            let cell = if format.protect_formulas && looks_like_formula(cell) {
-                protected = format!("'{cell}");
-                &protected
-            } else {
-                cell
-            };
-            if needs_quotes(cell, row.len() == 1, format) {
-                text.push(quote);
-                text.push_str(&cell.replace(quote, &doubled));
-                text.push(quote);
-            } else {
-                text.push_str(cell);
-            }
-        }
-        if format.trailing_delimiter {
-            text.push_str(delimiter);
-        }
-        text.push_str(newline);
+/// Why a table couldn't be written.
+#[derive(Debug)]
+pub enum WriteError {
+    Unencodable(Unencodable),
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for WriteError {
+    fn from(error: std::io::Error) -> Self {
+        WriteError::Io(error)
     }
-    Ok(match format.encoding {
-        Encoding::Utf8 => text.into_bytes(),
-        Encoding::Utf8Bom => {
-            let mut bytes = Vec::with_capacity(text.len() + 3);
-            bytes.extend_from_slice(b"\xEF\xBB\xBF");
-            bytes.extend_from_slice(text.as_bytes());
-            bytes
-        }
+}
+
+/// The table as a whole file, in memory.
+#[cfg(test)]
+pub fn write(table: &Table, format: &Format) -> Result<Vec<u8>, Unencodable> {
+    let mut bytes = Vec::new();
+    match write_to(table, format, &mut bytes) {
+        Ok(()) => Ok(bytes),
+        Err(WriteError::Unencodable(bad)) => Err(bad),
+        Err(WriteError::Io(error)) => unreachable!("writing to memory: {error}"),
+    }
+}
+
+/// Writes `text` to `out` in `encoding`, through `buf`; `false`: a
+/// character can't be written in it, and nothing was.
+fn encode<W: std::io::Write + ?Sized>(
+    text: &str,
+    encoding: Encoding,
+    buf: &mut Vec<u8>,
+    out: &mut W,
+) -> std::io::Result<bool> {
+    match encoding {
+        Encoding::Utf8 | Encoding::Utf8Bom => out.write_all(text.as_bytes())?,
         Encoding::Windows1252 => {
-            let (bytes, _, unmappable) = encoding_rs::WINDOWS_1252.encode(&text);
+            // ASCII text is borrowed as it is, not copied.
+            let (bytes, _, unmappable) = encoding_rs::WINDOWS_1252.encode(text);
             if unmappable {
-                return Err(first_unencodable(table, format));
+                return Ok(false);
             }
-            bytes.into_owned()
+            out.write_all(&bytes)?;
         }
         Encoding::Utf16Le | Encoding::Utf16Be => {
-            let little = format.encoding == Encoding::Utf16Le;
-            let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
-            for unit in std::iter::once(0xFEFF).chain(text.encode_utf16()) {
-                bytes.extend_from_slice(&if little {
+            let little = encoding == Encoding::Utf16Le;
+            buf.clear();
+            for unit in text.encode_utf16() {
+                buf.extend_from_slice(&if little {
                     unit.to_le_bytes()
                 } else {
                     unit.to_be_bytes()
                 });
             }
-            bytes
+            out.write_all(buf)?;
         }
-    })
+    }
+    Ok(true)
+}
+
+/// Writes the table to `out`, one line at a time: the whole file is
+/// never held in memory. On `WriteError::Unencodable`, `out` holds the
+/// lines before the bad one.
+pub fn write_to<W: std::io::Write + ?Sized>(
+    table: &Table,
+    format: &Format,
+    out: &mut W,
+) -> Result<(), WriteError> {
+    let delimiter = if format.delimiter.is_empty() {
+        ","
+    } else {
+        format.delimiter.as_str()
+    };
+    let quoting = Quoting::new(delimiter, format);
+    // A file without quoting gets double quotes where they can't be done
+    // without: the usual ones, which a reader expects.
+    let quote = format.quote.unwrap_or('"');
+    let newline = format.line_ending.as_str();
+    let encoding = format.encoding;
+    let mut buf = Vec::new();
+    let mut put = |text: &str, out: &mut W| -> Result<(), WriteError> {
+        if encode(text, encoding, &mut buf, out)? {
+            Ok(())
+        } else {
+            Err(WriteError::Unencodable(first_unencodable(table, format)))
+        }
+    };
+    // The byte order mark: EF BB BF in UTF-8, FEFF in UTF-16.
+    if matches!(
+        encoding,
+        Encoding::Utf8Bom | Encoding::Utf16Le | Encoding::Utf16Be
+    ) {
+        put("\u{FEFF}", out)?;
+    }
+    put(&format.preamble, out)?;
+    let mut line = String::new();
+    for row in table.rows() {
+        line.clear();
+        for (i, cell) in row.iter().enumerate() {
+            if i > 0 {
+                line.push_str(delimiter);
+            }
+            let protected;
+            let cell = if format.protect_formulas && looks_like_formula(cell) {
+                protected = format!("'{cell}");
+                protected.as_str()
+            } else {
+                cell.as_str()
+            };
+            if needs_quotes(cell, row.len() == 1, &quoting) {
+                line.push(quote);
+                for (i, piece) in cell.split(quote).enumerate() {
+                    if i > 0 {
+                        line.push(quote);
+                        line.push(quote);
+                    }
+                    line.push_str(piece);
+                }
+                line.push(quote);
+            } else {
+                line.push_str(cell);
+            }
+        }
+        if format.trailing_delimiter {
+            line.push_str(delimiter);
+        }
+        line.push_str(newline);
+        put(&line, out)?;
+    }
+    Ok(())
 }
 
 /// Whether a spreadsheet opening the file would take `cell` for a formula:
 /// it starts with =, +, -, @, a tab or a carriage return, and isn't a
 /// number ("-5" stays as it is).
 fn looks_like_formula(cell: &str) -> bool {
-    cell.starts_with(['=', '+', '-', '@', '\t', '\r'])
-        && cell.trim().replace(',', ".").parse::<f64>().is_err()
+    if !cell.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        return false;
+    }
+    let cell = cell.trim();
+    if !cell.contains(',') {
+        return cell.parse::<f64>().is_err();
+    }
+    // A decimal comma ("-5,25"), read as a point without an allocation
+    // for the usual short numbers.
+    let mut buf = [0; 64];
+    let Some(buf) = buf.get_mut(..cell.len()) else {
+        return cell.replace(',', ".").parse::<f64>().is_err();
+    };
+    for (to, &from) in buf.iter_mut().zip(cell.as_bytes()) {
+        *to = if from == b',' { b'.' } else { from };
+    }
+    // Replacing an ASCII byte by another keeps the text valid UTF-8.
+    std::str::from_utf8(buf).map_or(true, |text| text.parse::<f64>().is_err())
 }
 
 /// Where Windows-1252 first fails: in the kept lines, else in a cell.
@@ -1120,7 +1565,7 @@ mod tests {
     fn table(rows: &[&[&str]]) -> Table {
         Table::from_rows(
             rows.iter()
-                .map(|r| r.iter().map(|s| s.to_string()).collect())
+                .map(|r| r.iter().map(|s| Cell::from(*s)).collect())
                 .collect(),
         )
     }
@@ -1224,6 +1669,12 @@ mod tests {
             Edit::RemoveCols(0, 1),
             Edit::RemoveCols(0, 2),
             Edit::Reorder(1, original.sort_order(1, 1, false)),
+            Edit::Reorder(0, vec![2, 0, 3, 1]),
+            Edit::SetBlock(
+                1,
+                vec![1, 0],
+                vec![vec!["p".into(), "q".into()], vec!["r".into()]],
+            ),
         ];
         for edit in edits {
             let mut t = original.clone();
@@ -1234,6 +1685,68 @@ mod tests {
             t.apply(redo);
             assert_ne!(t, original, "{edit:?}");
         }
+    }
+
+    #[test]
+    fn a_block_sets_its_cells_and_gives_back_the_old_ones() {
+        let mut t = table(&[&["a", "b", "c"], &["d", "e", "f"], &["g", "h", "i"]]);
+        let undo = t.apply(Edit::SetBlock(
+            1,
+            vec![2, 0],
+            vec![vec!["x".into(), "y".into()], vec!["z".into()]],
+        ));
+        assert_eq!(
+            t,
+            table(&[&["a", "b", "c"], &["y", "e", "x"], &["g", "h", "z"]])
+        );
+        assert_eq!(
+            undo,
+            Edit::SetBlock(
+                1,
+                vec![2, 0],
+                vec![vec!["f".into(), "d".into()], vec!["i".into()]]
+            )
+        );
+        t.apply(undo);
+        assert_eq!(
+            t,
+            table(&[&["a", "b", "c"], &["d", "e", "f"], &["g", "h", "i"]])
+        );
+    }
+
+    #[test]
+    fn inserted_columns_grow_rows_by_exactly_their_count() {
+        let mut t = table(&[&["a", "b"], &["c", "d"]]);
+        t.apply(Edit::InsertCols(
+            1,
+            vec![vec!["1".into(), "2".into()], vec!["3".into(), "4".into()]],
+        ));
+        assert_eq!(t, table(&[&["a", "1", "3", "b"], &["c", "2", "4", "d"]]));
+        let big = Table::from_rows(vec![vec![Cell::default(); 300]; 3]);
+        let mut big = big;
+        for row in Arc::make_mut(&mut big.rows) {
+            row.shrink_to_fit();
+        }
+        big.apply(Edit::InsertCols(0, vec![vec![Cell::default(); 3]]));
+        assert!(
+            big.rows
+                .iter()
+                .all(|r| r.len() == 301 && r.capacity() == 301)
+        );
+    }
+
+    #[test]
+    fn reorders_in_place_and_inverts() {
+        let mut t = table(&[&["0"], &["1"], &["2"], &["3"], &["4"], &["5"]]);
+        // Two cycles and a row left in place.
+        let order = vec![2, 0, 1, 3, 5, 4];
+        let undo = t.apply(Edit::Reorder(0, order.clone()));
+        let column: Vec<_> = t.rows().iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(column, ["2", "0", "1", "3", "5", "4"]);
+        assert_eq!(undo, Edit::Reorder(0, invert(&order)));
+        t.apply(undo);
+        let column: Vec<_> = t.rows().iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(column, ["0", "1", "2", "3", "4", "5"]);
     }
 
     #[test]
@@ -1260,8 +1773,118 @@ mod tests {
     }
 
     #[test]
+    fn negative_numbers_with_a_decimal_comma_are_not_formulas() {
+        for number in ["-5", "-5,25", "+1.5", " -3 ", "-1e3"] {
+            assert!(!looks_like_formula(number), "{number:?}");
+        }
+        let long = format!("-{}", "1".repeat(80));
+        assert!(!looks_like_formula(&long));
+        assert!(!looks_like_formula(&format!("{long},5")));
+        for formula in ["=1", "-x", "-5,2,1", "@A1", "+", "-,"] {
+            assert!(looks_like_formula(formula), "{formula:?}");
+        }
+    }
+
+    #[test]
+    fn encodings_write_their_byte_order_mark_and_lines() {
+        let t = table(&[&["é", "\"q\""]]);
+        let format = |encoding| Format {
+            encoding,
+            line_ending: LineEnding::Lf,
+            preamble: "sep=,\n".into(),
+            ..Format::default()
+        };
+        let text = "sep=,\né,\"\"\"q\"\"\"\n";
+        let mut bom = b"\xEF\xBB\xBF".to_vec();
+        bom.extend_from_slice(text.as_bytes());
+        assert_eq!(write(&t, &format(Encoding::Utf8)).unwrap(), text.as_bytes());
+        assert_eq!(write(&t, &format(Encoding::Utf8Bom)).unwrap(), bom);
+        let latin: Vec<u8> = text.chars().map(|c| c as u8).collect();
+        assert_eq!(write(&t, &format(Encoding::Windows1252)).unwrap(), latin);
+        let units: Vec<u16> = "\u{FEFF}"
+            .encode_utf16()
+            .chain(text.encode_utf16())
+            .collect();
+        let le: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+        let be: Vec<u8> = units.iter().flat_map(|u| u.to_be_bytes()).collect();
+        assert_eq!(write(&t, &format(Encoding::Utf16Le)).unwrap(), le);
+        assert_eq!(write(&t, &format(Encoding::Utf16Be)).unwrap(), be);
+    }
+
+    #[test]
+    fn quotes_only_the_cells_that_need_them() {
+        let format = |delimiter: &str, quote| Format {
+            delimiter: delimiter.into(),
+            quote,
+            line_ending: LineEnding::Lf,
+            ..Format::default()
+        };
+        let cases: &[(&str, Option<char>, &str, bool)] = &[
+            (",", Some('"'), "plain", false),
+            (",", Some('"'), "a,b", true),
+            (",", Some('"'), "a\nb", true),
+            (",", Some('"'), "a\rb", true),
+            (",", Some('"'), "say \"hi\"", true),
+            (",", Some('\''), "it's", false),
+            (",", Some('\''), " 'x", true),
+            (",", None, "5\" screen", false),
+            (",", None, "\"x", true),
+            ("!#", Some('"'), "a!b#c", false),
+            ("!#", Some('"'), "a!#b", true),
+            ("!!", None, "a!", true),
+            ("!#", None, "a!", false),
+            ("abab", None, "xab", true),
+            ("abab", None, "xa", false),
+            (";", Some('"'), "\u{e9}t\u{e9};", true),
+        ];
+        for &(delimiter, quote, cell, expected) in cases {
+            let f = format(delimiter, quote);
+            let quoting = Quoting::new(delimiter, &f);
+            assert_eq!(
+                needs_quotes(cell, false, &quoting),
+                expected,
+                "{cell:?} with {delimiter:?}"
+            );
+        }
+        let f = format(",", Some('"'));
+        assert!(needs_quotes("", true, &Quoting::new(",", &f)));
+        assert!(!needs_quotes("", false, &Quoting::new(",", &f)));
+    }
+
+    #[test]
+    fn an_unencodable_character_names_its_cell() {
+        let format = Format {
+            encoding: Encoding::Windows1252,
+            ..Format::default()
+        };
+        let t = table(&[&["a", "b"], &["c", "\u{4E2D}"]]);
+        assert_eq!(
+            write(&t, &format),
+            Err(Unencodable {
+                character: '\u{4E2D}',
+                cell: Some((1, 1))
+            })
+        );
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_cells_as_they_were() {
+        let mut t = table(&[&["a", "b"]]);
+        let snapshot = t.clone();
+        assert!(Arc::ptr_eq(&t.rows, &snapshot.rows));
+        t.apply(Edit::SetCells(vec![(0, 0, "z".into())]));
+        assert_eq!(snapshot.cell(0, 0), "a");
+        assert_eq!(t.cell(0, 0), "z");
+        drop(snapshot);
+        // Alone again: edits change the cells in place.
+        let before = Arc::as_ptr(&t.rows);
+        t.apply(Edit::SetCells(vec![(0, 1, "y".into())]));
+        assert_eq!(Arc::as_ptr(&t.rows), before);
+    }
+
+    #[test]
     fn sorts_dates_and_times() {
-        let column = |t: &Table| -> Vec<String> { t.rows().iter().map(|r| r[0].clone()).collect() };
+        let column = |t: &Table| -> Vec<Cell> { t.rows().iter().map(|r| r[0].clone()).collect() };
         let mut t = table(&[
             &["create_time"],
             &["01/07/2026 17:55:46"],
@@ -1471,5 +2094,109 @@ mod tests {
         let preview = preview(bytes, &options(&[","]), 10);
         assert_eq!(preview.rows.len(), 3);
         assert_eq!(preview.lines, [2, 3, 5]);
+    }
+
+    fn limits(max_cells: usize, cancel: Option<&AtomicBool>) -> Limits<'_> {
+        Limits {
+            max_rows: usize::MAX,
+            max_cells,
+            lines: false,
+            cancel,
+        }
+    }
+
+    #[test]
+    fn too_many_cells_stop_the_parse_early() {
+        let text = "a,b,c\n".repeat(1000);
+        assert_eq!(
+            split_with(&text, &options(&[","]), &limits(100, None)).err(),
+            Some(Stop::TooLarge(TooLarge { rows: 51, cols: 3 }))
+        );
+        // A single line of delimiters is stopped too.
+        let text = ",".repeat(1000);
+        assert!(matches!(
+            split_with(&text, &options(&[","]), &limits(100, None)),
+            Err(Stop::TooLarge(TooLarge { rows: 1, .. }))
+        ));
+        // The empty field after a trailing delimiter isn't counted against
+        // the file: 50 rows of 2 cells fit in 100.
+        let text = "a,b,\n".repeat(50);
+        let parsed = split_with(&text, &options(&[","]), &limits(100, None)).expect("fits");
+        assert!(parsed.trailing_delimiter);
+        assert_eq!(parsed.rows.len(), 50);
+        assert!(parsed.lines.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_import_stops() {
+        let bytes = "a,b\n".repeat(10_000);
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            import_until(bytes.as_bytes(), &options(&[","]), &cancel),
+            Err(Stop::Cancelled)
+        ));
+        let text = "a,b\n".repeat(CANCEL_EVERY * 2);
+        assert!(matches!(
+            split_with(&text, &options(&[","]), &limits(usize::MAX, Some(&cancel))),
+            Err(Stop::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn valid_text_is_borrowed_not_copied() {
+        assert!(matches!(
+            decode_as(b"\xEF\xBB\xBFname", Encoding::Utf8Bom).text,
+            Cow::Borrowed("name")
+        ));
+        assert!(matches!(
+            decode_as(b"name", Encoding::Windows1252).text,
+            Cow::Borrowed("name")
+        ));
+        assert_eq!(decode_as(b"caf\xE9", Encoding::Windows1252).text, "café");
+    }
+
+    #[test]
+    fn delimiters_and_quotes_of_several_bytes() {
+        let options = ImportOptions {
+            quote: Some('«'),
+            ..options(&["→", "!#"])
+        };
+        assert_eq!(
+            split("«a→b«→c!#«x««y«\r\né→ü\rlast→", &options, usize::MAX),
+            [vec!["a→b", "c", "x«y"], vec!["é", "ü"], vec!["last", ""]]
+        );
+        // A character sharing its first byte with the delimiter is text.
+        assert_eq!(split("a—b→c", &options, usize::MAX), [vec!["a—b", "c"]]);
+    }
+
+    #[test]
+    fn rare_chars_are_listed_once() {
+        let table = table(&[&["Zoë", "abc"], &["ëé", "日本"]]);
+        assert_eq!(table.rare_chars(), "éë日本");
+    }
+}
+
+#[cfg(test)]
+mod memory {
+    /// The memory a large file takes once read: `CSVEDIT_BENCH=file.csv
+    /// cargo test --release memory -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn of_a_large_file() {
+        let Some(path) = std::env::var_os("CSVEDIT_BENCH") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let options = super::ImportOptions::detect(&bytes);
+        let before = crate::diag::process_memory().unwrap();
+        let imported = super::import(&bytes, &options).unwrap();
+        drop(bytes);
+        let after = crate::diag::process_memory().unwrap();
+        eprintln!(
+            "{:?} -> {:?} for {} rows",
+            before,
+            after,
+            imported.table.row_count()
+        );
     }
 }

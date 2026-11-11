@@ -2,19 +2,24 @@
 //! cells, the inspector and the status bar.
 
 mod bars;
+mod diagnostics;
+mod find;
 mod grid;
 mod inspector;
 mod titlebar;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 
 use crate::columns;
 use crate::i18n::t;
-use crate::import::{ImportDialog, Outcome, open_error_text};
-use crate::table::{self, Edit, Encoding, Format, LineEnding, Losses, Table, Unencodable};
+use crate::import::{ImportDialog, Outcome};
+use crate::save::SaveError;
+use crate::table::{self, Cell, Edit, Encoding, Format, LineEnding, Losses, Table, Unencodable};
 use crate::theme;
 
 pub use titlebar::resize_grips;
@@ -52,12 +57,38 @@ enum Pending {
     Quit,
 }
 
+/// A save being written, on a thread of its own (`save::spawn`).
+struct Saving {
+    path: PathBuf,
+    /// The format written, and the length of `undo` then (kept up to
+    /// date as `saved_depth` is): what is saved once it succeeds.
+    format: Format,
+    depth: Option<usize>,
+    /// Saved to a new name: there is no more to warn about.
+    save_as: bool,
+    /// What waits for the file to be saved.
+    then: Option<Pending>,
+    receiver: mpsc::Receiver<Result<(), SaveError>>,
+}
+
+/// Asked for while a save is being written: done once it ends.
+#[derive(Clone, Debug)]
+enum Queued {
+    Request(Pending),
+    Save(Option<Pending>),
+}
+
+/// "Saved" shows in the status bar this long.
+const SAVED_NOTICE: Duration = Duration::from_secs(3);
+
 /// A file dialog to show, at the end of the frame (it needs the window).
 #[derive(Clone, Debug)]
 enum FileRequest {
     Open,
     /// Then what was waiting for the file to be saved.
     SaveAs(Option<Pending>),
+    /// The diagnostics report, to a text file.
+    SaveReport(String),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,7 +114,7 @@ enum Command {
 }
 
 /// Height of the grid's rows.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Density {
     Compact,
     Normal,
@@ -109,28 +140,54 @@ struct ColumnStats {
     longest: usize,
 }
 
+impl ColumnStats {
+    fn add(&mut self, tally: Tally) {
+        if tally.empty {
+            self.empty += 1;
+        } else {
+            self.filled += 1;
+        }
+        self.longest = self.longest.max(tally.len);
+    }
+
+    /// Takes a cell out of the counts (the longest stays as it was).
+    fn remove(&mut self, tally: Tally) {
+        if tally.empty {
+            self.empty -= 1;
+        } else {
+            self.filled -= 1;
+        }
+    }
+}
+
+/// What a cell counts for in `ColumnStats`.
+#[derive(Clone, Copy)]
+struct Tally {
+    empty: bool,
+    len: usize,
+}
+
+impl Tally {
+    fn of(cell: &str) -> Tally {
+        Tally {
+            empty: cell.trim().is_empty(),
+            len: grapheme_count(cell),
+        }
+    }
+}
+
 /// A cell at some point of the table's history: (generation, row, column).
 type CellKey = (u64, usize, usize);
 /// Characters, words and `<BR>` tags of a cell.
 type Counts = (usize, usize, usize);
 
-/// Where the text being found was found.
-#[derive(Default)]
-struct Matches {
-    /// (generation, needle, columns shown) they were found for.
-    key: Option<(u64, String, Option<Vec<usize>>)>,
-    /// In the order the cells are shown: by row, then by shown column.
-    cells: Vec<(usize, usize)>,
-    /// The same, to light the cells up.
-    set: HashSet<(usize, usize)>,
-}
-
 pub struct CsvApp {
     table: Table,
     format: Format,
     path: Option<PathBuf>,
-    undo: Vec<Edit>,
-    redo: Vec<Edit>,
+    /// Undo and redo steps, with their estimated bytes (`Edit::bytes`).
+    undo: Vec<(Edit, u64)>,
+    redo: Vec<(Edit, u64)>,
     /// Length of `undo` when last saved; `None` once that state can't be
     /// reached again.
     saved_depth: Option<usize>,
@@ -143,11 +200,19 @@ pub struct CsvApp {
     /// "Save over the original?" is asked, then this waits.
     confirm_overwrite: Option<Option<Pending>>,
     file_request: Option<FileRequest>,
+    saving: Option<Saving>,
+    /// The last of what was asked for during the save.
+    queued: Option<Queued>,
+    /// When the last save succeeded, for "Saved" in the status bar.
+    saved_at: Option<Instant>,
+    diagnostics: diagnostics::Diagnostics,
     /// The workbook the table was read from: it is saved as a CSV file
     /// beside it, never over it.
     origin: Option<PathBuf>,
     /// A workbook's formulas, by (row, column), shown in the inspector.
-    formulas: HashMap<(usize, usize), String>,
+    /// Ordered, so that rows inserted or removed move only the formulas
+    /// below them.
+    formulas: BTreeMap<(usize, usize), Cell>,
     /// Cells that a spreadsheet would take for a formula are written with
     /// an apostrophe first (CSV injection).
     protect_formulas: bool,
@@ -157,6 +222,11 @@ pub struct CsvApp {
     grid_keys: bool,
     /// Counts the table's changes, for the caches.
     generation: u64,
+    /// The table was checked for characters the built-in fonts lack.
+    fonts_checked: bool,
+    /// The scripts of the text put in by edits since that the built-in
+    /// fonts lack.
+    unchecked_scripts: u16,
     /// The first row holds the column names: it stays at the top and is
     /// left out of sorting.
     header: bool,
@@ -172,15 +242,21 @@ pub struct CsvApp {
     scrolled: bool,
     /// Frames spent so far trying to reach it.
     scroll_tries: u8,
+    /// Rows the grid shows at once: what PageUp and PageDown move by.
+    page_rows: usize,
     /// The cell's editor was drawn this frame.
     editor_drawn: bool,
+    /// Widths of the columns resized, by column.
+    col_widths: Vec<f32>,
     find: String,
     focus_find: bool,
-    matches: Matches,
+    matches: find::Matches,
     /// (generation, column, first data row) and the stats found then.
     column_stats: Option<(u64, usize, usize, ColumnStats)>,
     /// (generation, row, column) and the inspector's counts then.
     cell_counts: Option<(CellKey, Counts)>,
+    /// The text typed in the inspector and its counts then.
+    editing_counts: Option<(String, Counts)>,
     inspector: bool,
     /// The columns shown, in this order; `None`: all of them.
     shown: Option<Vec<usize>>,
@@ -220,12 +296,18 @@ impl CsvApp {
             overwrite_accepted: false,
             confirm_overwrite: None,
             file_request: None,
+            saving: None,
+            queued: None,
+            saved_at: None,
+            diagnostics: diagnostics::Diagnostics::default(),
             origin: None,
-            formulas: HashMap::new(),
+            formulas: BTreeMap::new(),
             protect_formulas: protect_formulas_saved(),
             deferred: Vec::new(),
             grid_keys: false,
             generation: 0,
+            fonts_checked: false,
+            unchecked_scripts: 0,
             header: true,
             selected: (0, 0),
             editing: None,
@@ -234,12 +316,15 @@ impl CsvApp {
             scroll_to_selection: false,
             scrolled: false,
             scroll_tries: 0,
+            page_rows: 20,
             editor_drawn: false,
+            col_widths: Vec::new(),
             find: String::new(),
             focus_find: false,
-            matches: Matches::default(),
+            matches: find::Matches::default(),
             column_stats: None,
             cell_counts: None,
+            editing_counts: None,
             inspector: true,
             shown: None,
             columns_text: String::new(),
@@ -277,9 +362,16 @@ impl CsvApp {
             inspector: self.inspector,
             density: self.density,
             generation: self.generation + 1,
+            diagnostics: std::mem::take(&mut self.diagnostics),
+            protect_formulas: self.protect_formulas,
             ..Self::new(None)
         };
-        *self = fresh;
+        let mut old = std::mem::replace(self, fresh);
+        // A large table is freed away from the interface's thread.
+        if old.table.row_count().saturating_mul(old.table.col_count()) > 100_000 {
+            let table = std::mem::take(&mut old.table);
+            std::thread::spawn(move || drop(table));
+        }
     }
 
     // Files
@@ -287,7 +379,9 @@ impl CsvApp {
     /// Runs `action` now, or after asking to save the changes.
     fn request(&mut self, action: Pending) {
         self.commit_editing();
-        if self.dirty() {
+        if self.saving.is_some() {
+            self.queued = Some(Queued::Request(action));
+        } else if self.dirty() {
             self.pending = Some(action);
         } else {
             self.perform(action);
@@ -313,11 +407,19 @@ impl CsvApp {
                 self.import = Some(ImportDialog::new(path.to_owned(), bytes, self.header));
             }
             Err(error) => {
-                self.error = Some(t!(
-                    "error-open",
-                    file = file_name(path),
-                    error = error.to_string()
-                ));
+                let note = format!(
+                    "couldn't read a {} file: {:?}",
+                    file_kind(path),
+                    error.kind()
+                );
+                self.fail(
+                    t!(
+                        "error-open",
+                        file = file_name(path),
+                        error = io_error_text(&error)
+                    ),
+                    &note,
+                );
             }
         }
     }
@@ -327,6 +429,10 @@ impl CsvApp {
     /// left things out.
     fn save(&mut self, then: Option<Pending>) {
         self.commit_editing();
+        if self.saving.is_some() {
+            self.queued = Some(Queued::Save(then));
+            return;
+        }
         let Some(path) = self.path.clone() else {
             self.file_request = Some(FileRequest::SaveAs(then));
             return;
@@ -335,11 +441,7 @@ impl CsvApp {
             self.confirm_overwrite = Some(then);
             return;
         }
-        if self.save_to(&path)
-            && let Some(action) = then
-        {
-            self.perform(action);
-        }
+        self.save_to(&path, then, false);
     }
 
     /// The file dialogs, parented to the window so that they stay in front
@@ -373,6 +475,28 @@ impl CsvApp {
                     self.load(&path);
                 }
             }
+            FileRequest::SaveReport(report) => {
+                let saved = dialog
+                    .add_filter(t!("filter-text"), &["txt"])
+                    .set_file_name("csvedit-diagnostics.txt")
+                    .save_file()
+                    .map(|path| (std::fs::write(&path, report), path));
+                match saved {
+                    Some((Ok(()), _)) => {
+                        crate::diag::log(crate::diag::Level::Info, "diagnostics saved");
+                        self.diagnostics.notice(t!("diagnostics-saved"));
+                    }
+                    Some((Err(error), path)) => self.fail(
+                        t!(
+                            "error-save",
+                            file = file_name(&path),
+                            error = io_error_text(&error)
+                        ),
+                        &format!("couldn't save the diagnostics: {:?}", error.kind()),
+                    ),
+                    None => {}
+                }
+            }
             FileRequest::SaveAs(then) => {
                 self.commit_editing();
                 // A workbook's table goes to "name.csv", beside it.
@@ -385,88 +509,196 @@ impl CsvApp {
                     (None, None) => t!("untitled-file"),
                 };
                 dialog = dialog.add_filter(t!("filter-csv"), &["csv", "tsv", "txt"]);
-                if let Some(path) = dialog.set_file_name(name).save_file()
-                    && self.save_to(&path)
-                {
-                    // A new file holds everything: no more to warn about.
-                    self.losses = Losses::default();
-                    if let Some(action) = then {
-                        self.perform(action);
-                    }
+                if let Some(path) = dialog.set_file_name(name).save_file() {
+                    self.save_to(&path, then, true);
                 }
             }
         }
     }
 
-    fn save_to(&mut self, path: &Path) -> bool {
+    /// Starts writing the table to `path`, on a thread; `then` runs once
+    /// it is saved (`poll_saving`).
+    fn save_to(&mut self, path: &Path, then: Option<Pending>, save_as: bool) {
         let mut format = self.format.clone();
         format.protect_formulas = self.protect_formulas;
-        let result = match table::write(&self.table, &format) {
-            Ok(bytes) => write_safely(path, &bytes).map_err(|e| e.to_string()),
-            Err(Unencodable { character, cell }) => {
-                if let Some((row, col)) = cell {
-                    self.commit_editing();
-                    self.select(row, col);
-                }
-                let place =
-                    cell.map_or_else(String::new, |(row, col)| columns::reference(row, col));
-                Err(t!(
-                    "error-encoding",
-                    character = character.to_string(),
-                    code = format!("U+{:04X}", u32::from(character)),
-                    cell = place
-                ))
-            }
+        // A snapshot: the cells are shared until the next edit.
+        let receiver = crate::save::spawn(self.table.clone(), format, path.to_owned());
+        self.saved_at = None;
+        self.saving = Some(Saving {
+            path: path.to_owned(),
+            format: self.format.clone(),
+            depth: Some(self.undo.len()),
+            save_as,
+            then,
+            receiver,
+        });
+    }
+
+    /// Takes the result of the save being written, once there is one.
+    fn poll_saving(&mut self, ctx: &egui::Context) {
+        let Some(saving) = &self.saving else {
+            return;
         };
+        let result = match saving.receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.set_cursor_icon(egui::CursorIcon::Progress);
+                ctx.request_repaint_after(Duration::from_millis(50));
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(SaveError::Crashed),
+        };
+        let saving = self.saving.take().expect("a save");
         match result {
             Ok(()) => {
-                self.path = Some(path.to_owned());
-                self.saved_depth = Some(self.undo.len());
-                self.saved_format = self.format.clone();
-                true
+                crate::diag::log(
+                    crate::diag::Level::Info,
+                    &format!("saved a {} file", file_kind(&saving.path)),
+                );
+                self.path = Some(saving.path);
+                self.saved_depth = saving.depth;
+                self.saved_format = saving.format;
+                if saving.save_as {
+                    // A new file holds everything: no more to warn about.
+                    self.losses = Losses::default();
+                }
+                self.saved_at = Some(Instant::now());
+                if let Some(action) = saving.then {
+                    self.perform(action);
+                }
             }
             Err(error) => {
-                self.error = Some(t!("error-save", file = file_name(path), error = error));
-                false
+                let note = format!(
+                    "couldn't save a {} file: {}",
+                    file_kind(&saving.path),
+                    match &error {
+                        SaveError::Unencodable(_) => "a character the encoding lacks".to_owned(),
+                        SaveError::ReadOnly => "read-only".to_owned(),
+                        SaveError::Crashed => "the saving thread stopped".to_owned(),
+                        SaveError::Io(error) => format!("{:?}", error.kind()),
+                    }
+                );
+                let error = match error {
+                    SaveError::Unencodable(Unencodable { character, cell }) => {
+                        if let Some((row, col)) = cell
+                            && row < self.table.row_count()
+                            && col < self.table.col_count()
+                        {
+                            self.commit_editing();
+                            self.select(row, col);
+                        }
+                        let place = cell
+                            .map_or_else(String::new, |(row, col)| columns::reference(row, col));
+                        t!(
+                            "error-encoding",
+                            character = character.to_string(),
+                            code = format!("U+{:04X}", u32::from(character)),
+                            cell = place
+                        )
+                    }
+                    SaveError::ReadOnly => t!("error-read-only"),
+                    SaveError::Crashed => t!("error-save-crashed"),
+                    SaveError::Io(error) => io_error_text(&error),
+                };
+                self.fail(
+                    t!("error-save", file = file_name(&saving.path), error = error),
+                    &note,
+                );
             }
         }
+        if !self.allow_close
+            && let Some(queued) = self.queued.take()
+        {
+            match queued {
+                Queued::Request(action) => self.request(action),
+                Queued::Save(then) => self.save(then),
+            }
+        }
+    }
+
+    /// Loads the system's fonts once the text shown needs them.
+    fn cover_fonts(&mut self, ctx: &egui::Context) {
+        if theme::system_fonts_all_requested() {
+            self.unchecked_scripts = 0;
+            return;
+        }
+        if !self.fonts_checked {
+            self.fonts_checked = true;
+            self.unchecked_scripts |=
+                theme::scripts_needed(self.table.rows().iter().flatten().map(Cell::as_str));
+        }
+        let name = self.path.as_deref().map(file_name).unwrap_or_default();
+        // Everything else shown that is typed or comes from the system.
+        let texts = [
+            self.find.as_str(),
+            self.editing.as_deref().unwrap_or_default(),
+            name.as_str(),
+            self.error.as_deref().unwrap_or_default(),
+            self.columns_filter.as_str(),
+            self.columns_text.as_str(),
+            self.custom_delimiter.as_str(),
+        ];
+        let scripts = std::mem::take(&mut self.unchecked_scripts) | theme::scripts_needed(texts);
+        theme::load(ctx, scripts);
     }
 
     // Edits
 
     fn commit(&mut self, edit: Edit) {
-        self.remap_shown(&edit);
-        self.remap_formulas(&edit);
-        let inverse = self.table.apply(edit);
-        if self
-            .saved_depth
-            .is_some_and(|depth| depth > self.undo.len())
-        {
-            self.saved_depth = None;
+        if !theme::system_fonts_all_requested() {
+            self.unchecked_scripts |= new_text_scripts(&edit);
         }
-        self.undo.push(inverse);
+        let inverse = self.apply(edit);
+        let depth = self.undo.len();
+        let saving = self.saving.as_mut().map(|saving| &mut saving.depth);
+        for saved in std::iter::once(&mut self.saved_depth).chain(saving) {
+            if saved.is_some_and(|saved| saved > depth) {
+                *saved = None;
+            }
+        }
+        let bytes = inverse.bytes();
+        self.undo.push((inverse, bytes));
         self.redo.clear();
-        self.after_change();
+        let before = self.undo.len();
+        forget_oldest(&mut self.undo, &mut self.saved_depth, UNDO_BUDGET);
+        let forgotten = before - self.undo.len();
+        if let Some(saving) = &mut self.saving {
+            saving.depth = saving.depth.and_then(|depth| depth.checked_sub(forgotten));
+        }
     }
 
     fn undo(&mut self) {
         self.commit_editing();
-        if let Some(edit) = self.undo.pop() {
-            self.remap_shown(&edit);
-            self.remap_formulas(&edit);
-            self.redo.push(self.table.apply(edit));
-            self.after_change();
+        if let Some((edit, _)) = self.undo.pop() {
+            let inverse = self.apply(edit);
+            let bytes = inverse.bytes();
+            self.redo.push((inverse, bytes));
         }
     }
 
     fn redo(&mut self) {
         self.commit_editing();
-        if let Some(edit) = self.redo.pop() {
-            self.remap_shown(&edit);
-            self.remap_formulas(&edit);
-            self.undo.push(self.table.apply(edit));
-            self.after_change();
+        if let Some((edit, _)) = self.redo.pop() {
+            let inverse = self.apply(edit);
+            let bytes = inverse.bytes();
+            self.undo.push((inverse, bytes));
         }
+    }
+
+    /// Applies `edit` (also for undo and redo), keeping what follows the
+    /// table up to date; returns the edit that undoes it.
+    fn apply(&mut self, edit: Edit) -> Edit {
+        self.remap_shown(&edit);
+        self.remap_formulas(&edit);
+        let change = find::Change::of(&edit);
+        let before = self.generation;
+        let stats = self.stats_before(before, &change);
+        let inverse = self.table.apply(edit);
+        self.after_change();
+        self.matches
+            .follow(before, self.generation, &change, &self.table);
+        self.stats_after(stats);
+        inverse
     }
 
     fn after_change(&mut self) {
@@ -552,79 +784,17 @@ impl CsvApp {
     /// Keeps a workbook's formulas on their cells through `edit`, about to
     /// be applied; a cell given a new value loses its formula.
     fn remap_formulas(&mut self, edit: &Edit) {
-        if self.formulas.is_empty() {
-            return;
+        if !self.formulas.is_empty() {
+            remap_formulas(&mut self.formulas, edit);
         }
-        let moved = |f: &dyn Fn(usize, usize) -> Option<(usize, usize)>,
-                     map: &mut HashMap<_, _>| {
-            *map = std::mem::take(map)
-                .into_iter()
-                .filter_map(|((r, c), text)| f(r, c).map(|at| (at, text)))
-                .collect();
-        };
-        match edit {
-            Edit::Batch(edits) => {
-                for edit in edits {
-                    self.remap_formulas(edit);
-                }
-            }
-            Edit::SetCells(cells) => {
-                for (r, c, _) in cells {
-                    self.formulas.remove(&(*r, *c));
-                }
-            }
-            Edit::InsertRows(at, rows) => {
-                let (at, n) = (*at, rows.len());
-                moved(
-                    &|r, c| Some((if r >= at { r + n } else { r }, c)),
-                    &mut self.formulas,
-                );
-            }
-            Edit::RemoveRows(at, n) => {
-                let (at, n) = (*at, *n);
-                moved(
-                    &|r, c| match r {
-                        r if r < at => Some((r, c)),
-                        r if r < at + n => None,
-                        r => Some((r - n, c)),
-                    },
-                    &mut self.formulas,
-                );
-            }
-            Edit::InsertCols(at, cols) => {
-                let (at, n) = (*at, cols.len());
-                moved(
-                    &|r, c| Some((r, if c >= at { c + n } else { c })),
-                    &mut self.formulas,
-                );
-            }
-            Edit::RemoveCols(at, n) => {
-                let (at, n) = (*at, *n);
-                moved(
-                    &|r, c| match c {
-                        c if c < at => Some((r, c)),
-                        c if c < at + n => None,
-                        c => Some((r, c - n)),
-                    },
-                    &mut self.formulas,
-                );
-            }
-            Edit::Reorder(start, order) => {
-                // Row start + i takes old row start + order[i].
-                let mut new_place = vec![0; order.len()];
-                for (i, &from) in order.iter().enumerate() {
-                    new_place[from] = i;
-                }
-                let start = *start;
-                moved(
-                    &|r, c| match r.checked_sub(start) {
-                        Some(i) if i < new_place.len() => Some((start + new_place[i], c)),
-                        _ => Some((r, c)),
-                    },
-                    &mut self.formulas,
-                );
-            }
-        }
+    }
+
+    /// Shows `message` in an error dialog, and notes `note` in the log:
+    /// the message holds file names and maybe cell text, which the log
+    /// (kept, and sent with reports) must not.
+    fn fail(&mut self, message: String, note: &str) {
+        crate::diag::log(crate::diag::Level::Error, note);
+        self.error = Some(message);
     }
 
     /// Starts typing in the selected cell, in the grid or the inspector.
@@ -642,7 +812,7 @@ impl CsvApp {
         if let Some(text) = self.editing.take() {
             let (row, col) = self.selected;
             if text != self.table.cell(row, col) {
-                self.commit(Edit::SetCells(vec![(row, col, text)]));
+                self.commit(Edit::SetCells(vec![(row, col, Cell::from(text))]));
             }
         }
     }
@@ -667,7 +837,7 @@ impl CsvApp {
     }
 
     fn append_row(&mut self) {
-        let blank = vec![vec![String::new(); self.table.col_count()]];
+        let blank = vec![vec![Cell::default(); self.table.col_count()]];
         let row = self.table.row_count();
         self.commit(Edit::InsertRows(row, blank));
         self.select(row, self.selected.1);
@@ -676,8 +846,8 @@ impl CsvApp {
     fn run(&mut self, command: Command) {
         let (row, col) = self.selected;
         // Blank rows and columns, built only by the commands that use them.
-        fn blank(rows: usize, cols: usize) -> Vec<Vec<String>> {
-            vec![vec![String::new(); cols]; rows]
+        fn blank(rows: usize, cols: usize) -> Vec<Vec<Cell>> {
+            vec![vec![Cell::default(); cols]; rows]
         }
         let (row_count, col_count) = (self.table.row_count(), self.table.col_count());
         let blank_row = || blank(1, col_count);
@@ -741,8 +911,13 @@ impl CsvApp {
                 self.commit_editing();
                 let start = self.body_start();
                 let descending = matches!(command, Command::SortDescending);
-                let order = self.table.sort_order(start, col, descending);
-                if order.iter().enumerate().any(|(i, &from)| i != from) {
+                let order =
+                    crate::diag::measure("sort", || self.table.sort_order(start, col, descending));
+                if order
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &from)| i != from as usize)
+                {
                     self.commit(Edit::Reorder(start, order));
                 }
             }
@@ -766,7 +941,6 @@ impl CsvApp {
             .map(|line| line.trim_end_matches('\r').split('\t').collect())
             .collect();
         let (row, col) = self.selected;
-        let height = lines.len();
         let width = lines.iter().map(Vec::len).max().unwrap_or(0);
         let shown = self.shown_cols();
         let position = shown.iter().position(|&c| c == col).unwrap_or(0);
@@ -780,27 +954,7 @@ impl CsvApp {
             .chain(count..count + missing)
             .take(width)
             .collect();
-        let mut edits = Vec::new();
-        if missing > 0 {
-            let cols = vec![vec![String::new(); self.table.row_count()]; missing];
-            edits.push(Edit::InsertCols(count, cols));
-        }
-        let extra_rows = (row + height).saturating_sub(self.table.row_count());
-        if extra_rows > 0 {
-            let rows = vec![vec![String::new(); count + missing]; extra_rows];
-            edits.push(Edit::InsertRows(self.table.row_count(), rows));
-        }
-        let cells = lines
-            .iter()
-            .enumerate()
-            .flat_map(|(r, line)| {
-                let targets = &targets;
-                line.iter()
-                    .enumerate()
-                    .map(move |(c, text)| (row + r, targets[c], (*text).to_owned()))
-            })
-            .collect();
-        edits.push(Edit::SetCells(cells));
+        let edits = paste_edits(&lines, row, &targets, self.table.row_count(), count);
         self.commit(Edit::Batch(edits));
     }
 
@@ -812,46 +966,61 @@ impl CsvApp {
     }
 
     /// Cells of the shown columns containing the text being found, in the
-    /// order they are shown.
-    fn matches(&mut self) -> &[(usize, usize)] {
+    /// order they are shown, found through the whole table now.
+    fn matches(&mut self) -> &[(u32, u32)] {
         let needle = self.needle();
-        let key = (self.generation, needle.clone(), self.shown.clone());
-        if self.matches.key.as_ref() != Some(&key) {
-            let shown = self.shown_cols();
-            let mut cells = Vec::new();
-            if !needle.is_empty() {
-                for (r, row) in self.table.rows().iter().enumerate() {
-                    for &c in &shown {
-                        if contains_ignoring_case(&row[c], &needle) {
-                            cells.push((r, c));
-                        }
-                    }
-                }
-            }
-            self.matches.set = cells.iter().copied().collect();
-            self.matches.cells = cells;
-            self.matches.key = Some(key);
-        }
-        &self.matches.cells
+        self.matches.search(
+            &self.table,
+            self.generation,
+            &needle,
+            self.shown.as_ref(),
+            None,
+        );
+        self.matches.cells()
     }
 
-    /// Whether a cell is lit up as a match (`matches()` is called first
-    /// each frame).
+    /// Goes on with the search for a slice of time (the grid calls it each
+    /// frame), and asks for another frame while it is not done.
+    fn search_slice(&mut self, ctx: &egui::Context) {
+        let needle = self.needle();
+        let worked = self.matches.search(
+            &self.table,
+            self.generation,
+            &needle,
+            self.shown.as_ref(),
+            Some(find::SLICE),
+        );
+        if worked {
+            // The match count, drawn earlier this frame, is redrawn.
+            ctx.request_repaint();
+        }
+    }
+
+    /// Matches found so far, for the counts shown.
+    fn match_count(&self) -> usize {
+        self.matches.cells().len()
+    }
+
+    /// Whether a cell is lit up as a match.
     fn is_match(&self, row: usize, col: usize) -> bool {
-        self.matches.set.contains(&(row, col))
+        self.matches.contains(row, col)
     }
 
     /// Selects the next match after the selected cell (the previous one
     /// `backwards`), wrapping around.
     fn next_match(&mut self, backwards: bool) {
         let shown = self.shown_cols();
-        let order = |&(row, col): &(usize, usize)| {
+        let order = |&(row, col): &(u32, u32)| {
             (
                 row,
-                shown.iter().position(|&c| c == col).unwrap_or(usize::MAX),
+                shown
+                    .iter()
+                    .position(|&c| c == col as usize)
+                    .unwrap_or(usize::MAX),
             )
         };
-        let here = order(&self.selected);
+        let (row, col) = self.selected;
+        let here = order(&(row as u32, col as u32));
         let matches = self.matches();
         // In shown order: the first one past the selection, or before it.
         let after = matches.partition_point(|m| order(m) <= here);
@@ -866,7 +1035,7 @@ impl CsvApp {
         if let Some(i) = found {
             let (row, col) = matches[i];
             self.commit_editing();
-            self.select(row, col);
+            self.select(row as usize, col as usize);
         }
     }
 
@@ -885,16 +1054,56 @@ impl CsvApp {
             longest: 0,
         };
         for row in &self.table.rows()[start..] {
-            let cell = &row[col];
-            if cell.trim().is_empty() {
-                stats.empty += 1;
-            } else {
-                stats.filled += 1;
-            }
-            stats.longest = stats.longest.max(grapheme_count(cell));
+            stats.add(Tally::of(&row[col]));
         }
         self.column_stats = Some((self.generation, col, start, stats));
         stats
+    }
+
+    /// What the cells `change` is about to set count for in the column
+    /// stats, when they are up to date `before` it and it only sets cells.
+    fn stats_before(&self, before: u64, change: &find::Change) -> Option<Vec<(usize, Tally)>> {
+        let (generation, col, start, _) = self.column_stats?;
+        let cells = change.cells_only()?;
+        if generation != before {
+            return None;
+        }
+        let mut rows: Vec<usize> = cells
+            .iter()
+            .filter(|&&(r, c)| c == col && r >= start)
+            .map(|&(r, _)| r)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Some(
+            rows.into_iter()
+                .map(|r| (r, Tally::of(self.table.cell(r, col))))
+                .collect(),
+        )
+    }
+
+    /// Brings the column stats up to date with the edit just applied,
+    /// from what its cells counted for before (`stats_before`); otherwise
+    /// they are worked out again when next shown.
+    fn stats_after(&mut self, old: Option<Vec<(usize, Tally)>>) {
+        let (Some(old), Some((generation, col, _, stats))) = (old, &mut self.column_stats) else {
+            return;
+        };
+        let top = stats.longest;
+        // The longest cell got shorter: another may be the longest now.
+        let (mut dropped, mut reached) = (false, false);
+        for (row, before) in old {
+            let after = Tally::of(self.table.cell(row, *col));
+            dropped |= before.len == top && after.len < top;
+            reached |= after.len >= top;
+            stats.remove(before);
+            stats.add(after);
+        }
+        if dropped && !reached {
+            self.column_stats = None;
+        } else {
+            *generation = self.generation;
+        }
     }
 
     // Keyboard
@@ -960,13 +1169,26 @@ impl CsvApp {
                     pressed: true,
                     modifiers,
                     ..
+                } if modifiers.command && !modifiers.alt => {
+                    let jump = jump(key, (row, position), last_row, shown.len() - 1);
+                    if let Some((row, place)) = jump {
+                        self.grid_keys = true;
+                        self.select(row, shown[place]);
+                    }
+                }
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
                 } if modifiers.is_none() || modifiers.shift_only() => {
                     self.grid_keys = true;
+                    let page = self.page_rows.max(1);
                     match key {
                         Key::ArrowUp => self.select(row.saturating_sub(1), col),
                         Key::ArrowDown => self.select((row + 1).min(last_row), col),
-                        Key::PageUp => self.select(row.saturating_sub(20), col),
-                        Key::PageDown => self.select((row + 20).min(last_row), col),
+                        Key::PageUp => self.select(row.saturating_sub(page), col),
+                        Key::PageDown => self.select((row + page).min(last_row), col),
                         Key::ArrowLeft => self.select(row, left),
                         Key::Tab if modifiers.shift => self.select(row, left),
                         Key::ArrowRight | Key::Tab => self.select(row, right),
@@ -976,7 +1198,7 @@ impl CsvApp {
                             self.start_editing(self.table.cell(row, col).to_owned(), false)
                         }
                         Key::Delete | Key::Backspace if !self.table.cell(row, col).is_empty() => {
-                            self.commit(Edit::SetCells(vec![(row, col, String::new())]));
+                            self.commit(Edit::SetCells(vec![(row, col, Cell::default())]));
                         }
                         _ => {}
                     }
@@ -988,7 +1210,7 @@ impl CsvApp {
                 egui::Event::Cut => {
                     ctx.copy_text(self.table.cell(row, col).to_owned());
                     if !self.table.cell(row, col).is_empty() {
-                        self.commit(Edit::SetCells(vec![(row, col, String::new())]));
+                        self.commit(Edit::SetCells(vec![(row, col, Cell::default())]));
                     }
                 }
                 egui::Event::Paste(text) => self.paste(&text),
@@ -1015,41 +1237,51 @@ impl CsvApp {
             self.pending.is_some() || self.error.is_some() || self.confirm_overwrite.is_some();
         if !covered && let Some(dialog) = &mut self.import {
             match dialog.show(ctx) {
-                Some(Outcome::Open) => {
+                Some(Outcome::Open(imported)) => {
                     let dialog = self.import.take().expect("an import dialog");
                     let header = dialog.header;
                     let path = dialog.path.clone();
                     let book = dialog.is_workbook();
-                    match dialog.into_imported() {
-                        Ok(imported) => {
-                            // A workbook is never saved over: Save asks for
-                            // a CSV file.
-                            let saved_to = (!book).then(|| path.clone());
-                            self.reset(imported.table, imported.format, saved_to);
-                            self.losses = imported.losses;
-                            self.header = header;
-                            if book {
-                                self.origin = Some(path);
-                                self.formulas = imported
-                                    .formulas
-                                    .into_iter()
-                                    .map(|(r, c, f)| ((r, c), f))
-                                    .collect();
-                            }
-                        }
-                        Err(error) => {
-                            self.error = Some(t!(
-                                "error-open",
-                                file = file_name(&path),
-                                error = open_error_text(&error)
-                            ));
-                        }
+                    crate::diag::log(
+                        crate::diag::Level::Info,
+                        &format!(
+                            "opened a {} file ({}): {} rows x {} columns, waited {} for the reading",
+                            file_kind(&path),
+                            if book { "workbook" } else { "text" },
+                            imported.table.row_count(),
+                            imported.table.col_count(),
+                            crate::diag::ms(dialog.waited())
+                        ),
+                    );
+                    // Dropped away from the interface's thread, with the
+                    // preview it holds.
+                    std::thread::spawn(move || drop(dialog));
+                    let imported = *imported;
+                    // A workbook is never saved over: Save asks for a CSV
+                    // file.
+                    let saved_to = (!book).then(|| path.clone());
+                    self.reset(imported.table, imported.format, saved_to);
+                    self.losses = imported.losses;
+                    self.header = header;
+                    // The cells' characters were gathered by the reading.
+                    theme::cover(ctx, [imported.rare_chars.as_str()]);
+                    self.fonts_checked = true;
+                    if book {
+                        self.origin = Some(path);
+                        self.formulas = imported
+                            .formulas
+                            .into_iter()
+                            .map(|(r, c, f)| ((r, c), Cell::from(f)))
+                            .collect();
                     }
                 }
                 Some(Outcome::Cancel) => self.import = None,
                 None => {}
             }
         }
+        // Drawn in the order they can stack in, the one on top last: egui
+        // gives the keyboard and the mouse to the last dialog drawn.
+        self.diagnostics_window(ctx);
         if let Some(then) = self.confirm_overwrite.clone() {
             let mut answer = None;
             theme::modal("confirm-overwrite", ctx).show(ctx, |ui| {
@@ -1074,7 +1306,7 @@ impl CsvApp {
                 ui.add_space(18.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::primary_button(ui, &t!("overwrite-save-as"), 0.0).clicked()
-                        || ui.input(|i| i.key_pressed(Key::Enter))
+                        || theme::dialog_key(ui, Key::Enter)
                     {
                         answer = Some(false);
                     }
@@ -1082,7 +1314,7 @@ impl CsvApp {
                         answer = Some(true);
                     }
                     if theme::secondary_button(ui, &t!("cancel"), 0.0).clicked()
-                        || ui.input(|i| i.key_pressed(Key::Escape))
+                        || theme::dialog_key(ui, Key::Escape)
                     {
                         self.confirm_overwrite = None;
                     }
@@ -1108,7 +1340,7 @@ impl CsvApp {
                 ui.add_space(18.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::primary_button(ui, &t!("save-changes-save"), 0.0).clicked()
-                        || ui.input(|i| i.key_pressed(Key::Enter))
+                        || theme::dialog_key(ui, Key::Enter)
                     {
                         answer = Some(true);
                     }
@@ -1116,7 +1348,7 @@ impl CsvApp {
                         answer = Some(false);
                     }
                     if theme::secondary_button(ui, &t!("cancel"), 0.0).clicked()
-                        || ui.input(|i| i.key_pressed(Key::Escape))
+                        || theme::dialog_key(ui, Key::Escape)
                     {
                         self.pending = None;
                     }
@@ -1131,20 +1363,6 @@ impl CsvApp {
                 }
             }
         }
-        if let Some(error) = self.error.clone() {
-            theme::modal("error", ctx).show(ctx, |ui| {
-                ui.set_max_width(440.0);
-                ui.label(error);
-                ui.add_space(18.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::primary_button(ui, &t!("ok"), 80.0).clicked()
-                        || ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape))
-                    {
-                        self.error = None;
-                    }
-                });
-            });
-        }
         if self.about && !self.licenses {
             theme::modal("about", ctx).show(ctx, |ui| {
                 ui.set_width(360.0);
@@ -1156,7 +1374,7 @@ impl CsvApp {
                 ui.add_space(18.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::primary_button(ui, &t!("ok"), 80.0).clicked()
-                        || ui.input(|i| i.key_pressed(Key::Escape))
+                        || theme::dialog_key(ui, Key::Escape)
                     {
                         self.about = false;
                     }
@@ -1169,14 +1387,18 @@ impl CsvApp {
         if self.licenses {
             // The notices the crates' licenses ask to go with the program.
             const LICENSES: &str = include_str!("../../THIRD-PARTY-LICENSES.txt");
+            let room =
+                theme::dialog_room(ctx, egui::vec2(688.0, f32::INFINITY)) - egui::vec2(48.0, 48.0);
             theme::modal("licenses", ctx).show(ctx, |ui| {
-                ui.set_width(640.0);
+                ui.set_width(room.x);
                 ui.heading(t!("about-third-party"));
                 ui.add_space(8.0);
+                let list_height =
+                    (room.y - ui.min_rect().height() - 24.0 - 36.0).clamp(60.0, 420.0);
                 let lines: Vec<&str> = LICENSES.lines().collect();
                 let height = ui.text_style_height(&egui::TextStyle::Monospace);
                 egui::ScrollArea::vertical()
-                    .max_height(420.0)
+                    .max_height(list_height)
                     .auto_shrink([false, false])
                     .show_rows(ui, height, lines.len(), |ui, range| {
                         for line in &lines[range] {
@@ -1186,9 +1408,24 @@ impl CsvApp {
                 ui.add_space(12.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::primary_button(ui, &t!("ok"), 80.0).clicked()
-                        || ui.input(|i| i.key_pressed(Key::Escape))
+                        || theme::dialog_key(ui, Key::Escape)
                     {
                         self.licenses = false;
+                    }
+                });
+            });
+        }
+        // Last: it can come over the others (saving the diagnostics, say).
+        if let Some(error) = self.error.clone() {
+            theme::modal("error", ctx).show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                ui.label(error);
+                ui.add_space(18.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::primary_button(ui, &t!("ok"), 80.0).clicked()
+                        || (theme::dialog_key(ui, Key::Enter) || theme::dialog_key(ui, Key::Escape))
+                    {
+                        self.error = None;
                     }
                 });
             });
@@ -1218,25 +1455,44 @@ impl CsvApp {
 
 impl eframe::App for CsvApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let started = std::time::Instant::now();
         let ctx = ui.ctx().clone();
+        self.diagnostics.frames.start_pass(
+            ctx.cumulative_frame_nr(),
+            frame.info().cpu_usage,
+            started,
+        );
         self.grid_keys = false;
+        self.read_gpu(frame);
+        self.cover_fonts(&ctx);
+        self.poll_saving(&ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             self.commit_editing();
-            if self.dirty() {
+            if self.saving.is_some() {
+                // Closed once the file is written (and asked again then
+                // if there are newer changes).
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.queued = Some(Queued::Request(Pending::Quit));
+            } else if self.dirty() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.pending = Some(Pending::Quit);
             }
-        }
-        if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_owned()))
-        {
-            self.request(Pending::Open(Some(path)));
         }
         let modal_open = self.pending.is_some()
             || self.error.is_some()
             || self.about
             || self.import.is_some()
-            || self.confirm_overwrite.is_some();
+            || self.confirm_overwrite.is_some()
+            || self.diagnostics.open;
+        // A file dropped on a dialog is ignored: it would open another
+        // dialog over it.
+        if !modal_open
+            && let Some(path) =
+                ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_owned()))
+        {
+            self.request(Pending::Open(Some(path)));
+        }
         if !modal_open {
             self.handle_shortcuts(&ctx);
             self.handle_grid_keys(&ctx);
@@ -1293,8 +1549,14 @@ impl eframe::App for CsvApp {
         }
         self.dialogs(&ctx);
         resize_grips(&ctx);
-        if let Some(request) = self.file_request.take() {
+        // Waits for the save being written (a new name, or another file).
+        if self.saving.is_none()
+            && let Some(request) = self.file_request.take()
+        {
+            // The time the user takes to choose is not the frame's.
+            let waiting = std::time::Instant::now();
             self.file_dialog(request, frame);
+            self.diagnostics.frames.waited(waiting.elapsed());
         }
         // Tab and arrows move the grid's selection, not egui's keyboard
         // focus: a button given focus would take Enter and Space.
@@ -1309,7 +1571,218 @@ impl eframe::App for CsvApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.update_title(&ctx);
+        self.diagnostics.frames.end_pass(started);
     }
+}
+
+/// Where Ctrl (Cmd) with `key` moves the selection, at (row, place among
+/// the columns shown): Home and End to the first and last cell, the arrows
+/// to the table's edge that way.
+fn jump(
+    key: Key,
+    (row, place): (usize, usize),
+    last_row: usize,
+    last_place: usize,
+) -> Option<(usize, usize)> {
+    match key {
+        Key::Home => Some((0, 0)),
+        Key::End => Some((last_row, last_place)),
+        Key::ArrowUp => Some((0, place)),
+        Key::ArrowDown => Some((last_row, place)),
+        Key::ArrowLeft => Some((row, 0)),
+        Key::ArrowRight => Some((row, last_place)),
+        _ => None,
+    }
+}
+
+/// Most bytes the undo steps keep (`Edit::bytes`): past it, the oldest
+/// steps are forgotten.
+const UNDO_BUDGET: u64 = 256 << 20;
+
+/// Forgets the oldest steps of `undo` while they keep more than `budget`
+/// bytes, always keeping the latest one; `saved_depth` (a length of
+/// `undo`) follows, and is `None` once the saved state is forgotten.
+fn forget_oldest(undo: &mut Vec<(Edit, u64)>, saved_depth: &mut Option<usize>, budget: u64) {
+    let mut total: u64 = undo.iter().map(|(_, bytes)| bytes).sum();
+    let mut forgotten = 0;
+    while total > budget && forgotten + 1 < undo.len() {
+        total -= undo[forgotten].1;
+        forgotten += 1;
+    }
+    if forgotten > 0 {
+        undo.drain(..forgotten);
+        *saved_depth = saved_depth.and_then(|depth| depth.checked_sub(forgotten));
+    }
+}
+
+/// Keeps `formulas` on their cells through `edit`, about to be applied; a
+/// cell given a new value loses its formula. Only the formulas that move
+/// are touched.
+fn remap_formulas(formulas: &mut BTreeMap<(usize, usize), Cell>, edit: &Edit) {
+    // Rebuilt with the formulas moved (kept in order by `f`), when any
+    // is at or past column `at`.
+    fn cols(
+        formulas: &mut BTreeMap<(usize, usize), Cell>,
+        at: usize,
+        f: impl Fn(usize) -> Option<usize>,
+    ) {
+        if formulas.keys().any(|&(_, c)| c >= at) {
+            *formulas = std::mem::take(formulas)
+                .into_iter()
+                .filter_map(|((r, c), text)| f(c).map(|c| ((r, c), text)))
+                .collect();
+        }
+    }
+    match edit {
+        Edit::Batch(edits) => {
+            for edit in edits {
+                remap_formulas(formulas, edit);
+            }
+        }
+        Edit::SetCells(cells) => {
+            for (r, c, _) in cells {
+                formulas.remove(&(*r, *c));
+            }
+        }
+        Edit::SetBlock(top, cols, values) => {
+            for (i, line) in values.iter().enumerate() {
+                for &c in &cols[..line.len()] {
+                    formulas.remove(&(top + i, c));
+                }
+            }
+        }
+        Edit::InsertRows(at, rows) => {
+            let below = formulas.split_off(&(*at, 0));
+            let n = rows.len();
+            formulas.extend(below.into_iter().map(|((r, c), text)| ((r + n, c), text)));
+        }
+        Edit::RemoveRows(at, n) => {
+            let below = formulas.split_off(&(*at, 0));
+            let (at, n) = (*at, *n);
+            formulas.extend(
+                below
+                    .into_iter()
+                    .filter(|&((r, _), _)| r >= at + n)
+                    .map(|((r, c), text)| ((r - n, c), text)),
+            );
+        }
+        Edit::InsertCols(at, added) => {
+            let (at, n) = (*at, added.len());
+            cols(formulas, at, |c| Some(if c >= at { c + n } else { c }));
+        }
+        Edit::RemoveCols(at, n) => {
+            let (at, n) = (*at, *n);
+            cols(formulas, at, |c| match c {
+                c if c < at => Some(c),
+                c if c < at + n => None,
+                c => Some(c - n),
+            });
+        }
+        Edit::Reorder(start, order) => {
+            let start = *start;
+            let below = formulas.split_off(&(start, 0));
+            if below.is_empty() {
+                return;
+            }
+            // Row start + i takes old row start + order[i].
+            let new_place = crate::table::invert(order);
+            formulas.extend(below.into_iter().map(|((r, c), text)| {
+                let row = match new_place.get(r - start) {
+                    Some(&i) => start + i as usize,
+                    None => r,
+                };
+                ((row, c), text)
+            }));
+        }
+    }
+}
+
+/// The edits that paste `lines` (cells by line) from row `row` on, line
+/// `i` going to row `row + i` and cell `j` to column `targets[j]`, into a
+/// table of `row_count` rows and `col_count` columns. The targets past the
+/// last column are new columns (in order, at the end), and lines past the
+/// last row new rows: these are inserted holding their text, so that only
+/// the cells that were there before are kept for undo.
+fn paste_edits(
+    lines: &[Vec<&str>],
+    row: usize,
+    targets: &[usize],
+    row_count: usize,
+    col_count: usize,
+) -> Vec<Edit> {
+    let old_cols = targets.iter().take_while(|&&c| c < col_count).count();
+    let new_cols = targets.len() - old_cols;
+    let old_lines = lines.len().min(row_count - row);
+    let mut edits = Vec::new();
+    if new_cols > 0 {
+        let cols = (old_cols..targets.len())
+            .map(|j| {
+                (0..row_count)
+                    .map(|r| {
+                        r.checked_sub(row)
+                            .and_then(|i| lines.get(i)?.get(j))
+                            .map_or_else(Cell::default, |text| Cell::new(text))
+                    })
+                    .collect()
+            })
+            .collect();
+        edits.push(Edit::InsertCols(col_count, cols));
+    }
+    if lines.len() > old_lines {
+        let width = col_count + new_cols;
+        let rows = lines[old_lines..]
+            .iter()
+            .map(|line| {
+                let mut cells = vec![Cell::default(); width];
+                for (text, &c) in line.iter().zip(targets) {
+                    cells[c] = Cell::new(text);
+                }
+                cells
+            })
+            .collect();
+        edits.push(Edit::InsertRows(row_count, rows));
+    }
+    let values = lines[..old_lines]
+        .iter()
+        .map(|line| {
+            line.iter()
+                .take(old_cols)
+                .map(|text| Cell::new(text))
+                .collect()
+        })
+        .collect();
+    edits.push(Edit::SetBlock(row, targets[..old_cols].to_vec(), values));
+    edits
+}
+
+/// The scripts of the text an edit puts in that the built-in fonts lack.
+fn new_text_scripts(edit: &Edit) -> u16 {
+    match edit {
+        Edit::SetCells(cells) => theme::scripts_needed(cells.iter().map(|(_, _, c)| c.as_str())),
+        Edit::InsertRows(_, r) | Edit::InsertCols(_, r) | Edit::SetBlock(_, _, r) => {
+            theme::scripts_needed(r.iter().flatten().map(Cell::as_str))
+        }
+        Edit::Batch(edits) => edits.iter().fold(0, |all, e| all | new_text_scripts(e)),
+        Edit::RemoveRows(..) | Edit::RemoveCols(..) | Edit::Reorder(..) => 0,
+    }
+}
+
+/// What went wrong reading or writing a file, for the user: in their
+/// language when it is common, else as the system says it.
+fn io_error_text(error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => t!("error-not-found"),
+        std::io::ErrorKind::PermissionDenied => t!("error-permission"),
+        _ => error.to_string(),
+    }
+}
+
+/// "csv", "xlsx": a file's kind for the log, which keeps no file names.
+fn file_kind(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map_or_else(|| "other".to_owned(), str::to_ascii_lowercase)
 }
 
 fn file_name(path: &Path) -> String {
@@ -1322,6 +1795,9 @@ fn file_name(path: &Path) -> String {
 /// A cell's text on one line: line breaks, real ones and HTML `<BR>` tags
 /// (Poliris files), shown as "↵".
 pub fn flat_text(text: &str) -> String {
+    if !text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'<')) {
+        return text.to_owned();
+    }
     let mut flat = String::with_capacity(text.len());
     for (i, part) in split_breaks(text).into_iter().enumerate() {
         if i > 0 {
@@ -1375,12 +1851,21 @@ fn br_tag_len(text: &str) -> Option<usize> {
 /// allocating when the needle is ASCII.
 pub fn contains_ignoring_case(text: &str, needle: &str) -> bool {
     if needle.is_ascii() {
-        let needle = needle.as_bytes();
-        text.len() >= needle.len()
-            && text
-                .as_bytes()
-                .windows(needle.len())
-                .any(|w| w.eq_ignore_ascii_case(needle))
+        let (text, needle) = (text.as_bytes(), needle.as_bytes());
+        let (Some(&first), Some(last)) = (needle.first(), text.len().checked_sub(needle.len()))
+        else {
+            return needle.is_empty();
+        };
+        if !needle.iter().any(u8::is_ascii_alphabetic) {
+            return memchr::memmem::find(text, needle).is_some();
+        }
+        // Only where the first character is, in either case.
+        memchr::memchr2_iter(
+            first.to_ascii_lowercase(),
+            first.to_ascii_uppercase(),
+            &text[..=last],
+        )
+        .any(|i| text[i..i + needle.len()].eq_ignore_ascii_case(needle))
     } else {
         !text.is_ascii() && text.to_lowercase().contains(needle)
     }
@@ -1390,6 +1875,15 @@ pub fn contains_ignoring_case(text: &str, needle: &str) -> bool {
 /// of several code points counts once.
 pub fn grapheme_count(text: &str) -> usize {
     use unicode_segmentation::UnicodeSegmentation as _;
+    if text.is_ascii() {
+        // Each byte is one, but for a CR LF line break.
+        let crlf = if text.contains('\r') {
+            memchr::memmem::find_iter(text.as_bytes(), b"\r\n").count()
+        } else {
+            0
+        };
+        return text.len() - crlf;
+    }
     text.graphemes(true).count()
 }
 
@@ -1413,44 +1907,6 @@ fn save_protect_formulas(on: bool) {
     let dir = crate::config::dir();
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("protect-formulas"), if on { "on" } else { "off" });
-}
-
-/// Writes `bytes` to a new file beside `path`, then puts it in its place:
-/// a failure halfway leaves the old file whole.
-fn write_safely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    // A link is followed, not replaced.
-    let target = match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)?,
-        _ => path.to_owned(),
-    };
-    let dir = target.parent().filter(|d| !d.as_os_str().is_empty());
-    let name = target.file_name().unwrap_or_default().to_string_lossy();
-    let temp = dir.map_or_else(
-        || PathBuf::from(format!(".{name}.csvedit-tmp")),
-        |d| d.join(format!(".{name}.csvedit-tmp")),
-    );
-    let written = (|| {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        if let Ok(meta) = std::fs::metadata(&target) {
-            std::fs::set_permissions(&temp, meta.permissions())?;
-        }
-        std::fs::rename(&temp, &target)
-    })();
-    match written {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = std::fs::remove_file(&temp);
-            // A folder that takes no new file: write in place, as before.
-            if error.kind() == std::io::ErrorKind::PermissionDenied && target.exists() {
-                std::fs::write(&target, bytes)
-            } else {
-                Err(error)
-            }
-        }
-    }
 }
 
 pub(crate) fn delimiter_name(delimiter: &str) -> String {
@@ -1499,6 +1955,18 @@ mod tests {
     use crate::i18n::{self, Lang};
 
     #[test]
+    fn ctrl_keys_jump_to_the_table_edges() {
+        let at = (5, 2);
+        assert_eq!(jump(Key::Home, at, 99, 7), Some((0, 0)));
+        assert_eq!(jump(Key::End, at, 99, 7), Some((99, 7)));
+        assert_eq!(jump(Key::ArrowUp, at, 99, 7), Some((0, 2)));
+        assert_eq!(jump(Key::ArrowDown, at, 99, 7), Some((99, 2)));
+        assert_eq!(jump(Key::ArrowLeft, at, 99, 7), Some((5, 0)));
+        assert_eq!(jump(Key::ArrowRight, at, 99, 7), Some((5, 7)));
+        assert_eq!(jump(Key::A, at, 99, 7), None);
+    }
+
+    #[test]
     fn formulas_follow_their_cells() {
         let mut app = CsvApp::new(None);
         app.reset(Table::empty(3, 2), Format::default(), None);
@@ -1507,7 +1975,7 @@ mod tests {
         app.run(Command::InsertRowAbove);
         app.run(Command::InsertColLeft);
         assert_eq!(
-            app.formulas.get(&(3, 2)).map(String::as_str),
+            app.formulas.get(&(3, 2)).map(Cell::as_str),
             Some("SUM(B1:B2)")
         );
         app.undo();
@@ -1538,6 +2006,142 @@ mod tests {
         assert_eq!(app.table, Table::default());
     }
 
+    fn grid(rows: &[&[&str]]) -> Table {
+        Table::from_rows(
+            rows.iter()
+                .map(|r| r.iter().map(|&c| Cell::from(c)).collect())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn paste_over_ragged_lines_hidden_columns_and_new_cells_undoes_exactly() {
+        let mut app = CsvApp::new(None);
+        let start = grid(&[&["a", "b", "c"], &["d", "e", "f"]]);
+        app.reset(start.clone(), Format::default(), None);
+        // Column B hidden: the paste goes to C, A, then new columns.
+        app.shown = Some(vec![2, 0]);
+        app.selected = (1, 2);
+        app.paste("1\t2\t3\t4\n5\n6\t7\t\t8\n");
+        let pasted = grid(&[
+            &["a", "b", "c", "", ""],
+            &["2", "e", "1", "3", "4"],
+            &["", "", "5", "", ""],
+            &["7", "", "6", "", "8"],
+        ]);
+        assert_eq!(app.table, pasted);
+        // Only the cells that were there are kept for undo.
+        let (undo, _) = app.undo.last().unwrap();
+        let Edit::Batch(steps) = undo else {
+            panic!("{undo:?}")
+        };
+        assert_eq!(
+            steps[0],
+            Edit::SetBlock(1, vec![2, 0], vec![vec!["f".into(), "d".into()]])
+        );
+        app.undo();
+        assert_eq!(app.table, start);
+        app.redo();
+        assert_eq!(app.table, pasted);
+        app.undo();
+        assert_eq!(app.table, start);
+        assert!(!app.dirty());
+    }
+
+    #[test]
+    fn paste_inside_the_table_sets_a_block() {
+        let mut app = CsvApp::new(None);
+        let start = grid(&[&["a", "b"], &["c", "d"], &["e", "f"]]);
+        app.reset(start.clone(), Format::default(), None);
+        app.selected = (1, 0);
+        app.paste("x\ty\r\nz\r\n");
+        assert_eq!(app.table, grid(&[&["a", "b"], &["x", "y"], &["z", "f"]]));
+        app.undo();
+        assert_eq!(app.table, start);
+    }
+
+    #[test]
+    fn the_oldest_undo_steps_go_past_the_budget() {
+        let step = |bytes| (Edit::RemoveRows(0, 1), bytes);
+        let mut undo = vec![step(10), step(10), step(10), step(10)];
+        let mut saved = Some(3);
+        forget_oldest(&mut undo, &mut saved, 25);
+        assert_eq!(undo.len(), 2);
+        // Saved after the third step: one undo away still.
+        assert_eq!(saved, Some(1));
+        forget_oldest(&mut undo, &mut saved, 5);
+        assert_eq!(undo.len(), 1, "the latest step stays");
+        assert_eq!(saved, Some(0));
+        undo.push(step(10));
+        forget_oldest(&mut undo, &mut saved, 15);
+        assert_eq!(saved, None, "the saved state can't be reached again");
+        let mut undo = vec![step(10), step(10)];
+        let mut saved = Some(2);
+        forget_oldest(&mut undo, &mut saved, 100);
+        assert_eq!((undo.len(), saved), (2, Some(2)));
+    }
+
+    #[test]
+    fn undo_stays_exact_once_old_steps_are_forgotten() {
+        let mut app = CsvApp::new(None);
+        app.reset(grid(&[&["0"]]), Format::default(), None);
+        for i in 1..=5 {
+            app.commit(Edit::SetCells(vec![(0, 0, Cell::from(i.to_string()))]));
+            // As if the budget held three steps (all of the same size).
+            let step = app.undo[0].1;
+            forget_oldest(&mut app.undo, &mut app.saved_depth, step * 3);
+        }
+        let kept = app.undo.len();
+        assert_eq!(kept, 3);
+        for _ in 0..kept {
+            app.undo();
+        }
+        let expected = (5 - kept).to_string();
+        assert_eq!(app.table.cell(0, 0), expected);
+        assert!(app.dirty(), "the opened state is gone");
+        for _ in 0..kept {
+            app.redo();
+        }
+        assert_eq!(app.table.cell(0, 0), "5");
+    }
+
+    #[test]
+    fn formulas_follow_rows_columns_and_sorts() {
+        let mut f = BTreeMap::new();
+        for key in [(0, 0), (1, 1), (2, 0), (3, 2)] {
+            f.insert(key, Cell::from(format!("{key:?}")));
+        }
+        let keys = |f: &BTreeMap<(usize, usize), Cell>| f.keys().copied().collect::<Vec<_>>();
+        let mut g = f.clone();
+        remap_formulas(&mut g, &Edit::InsertRows(4, vec![vec![]]));
+        assert_eq!(g, f, "a row added at the end moves nothing");
+        remap_formulas(&mut g, &Edit::InsertRows(2, vec![vec![], vec![]]));
+        assert_eq!(keys(&g), [(0, 0), (1, 1), (4, 0), (5, 2)]);
+        remap_formulas(&mut g, &Edit::RemoveRows(1, 4));
+        assert_eq!(keys(&g), [(0, 0), (1, 2)]);
+        assert_eq!(g[&(1, 2)], "(3, 2)");
+        let mut g = f.clone();
+        remap_formulas(&mut g, &Edit::InsertCols(1, vec![vec![]]));
+        assert_eq!(keys(&g), [(0, 0), (1, 2), (2, 0), (3, 3)]);
+        remap_formulas(&mut g, &Edit::RemoveCols(0, 1));
+        assert_eq!(keys(&g), [(1, 1), (3, 2)]);
+        let mut g = f.clone();
+        // Rows 1.. become old rows 3, 1, 2.
+        remap_formulas(&mut g, &Edit::Reorder(1, vec![2, 0, 1]));
+        assert_eq!(keys(&g), [(0, 0), (1, 2), (2, 1), (3, 0)]);
+        assert_eq!(g[&(1, 2)], "(3, 2)");
+        let mut g = f.clone();
+        remap_formulas(
+            &mut g,
+            &Edit::SetBlock(
+                1,
+                vec![1, 0],
+                vec![vec!["".into()], vec!["".into(), "".into()]],
+            ),
+        );
+        assert_eq!(keys(&g), [(0, 0), (3, 2)]);
+    }
+
     #[test]
     fn undoing_back_to_the_saved_state_is_clean() {
         let mut app = CsvApp::new(None);
@@ -1553,6 +2157,63 @@ mod tests {
         assert_eq!(app.saved_depth, None);
     }
 
+    /// Polls until the save being written ends.
+    fn finish_saving(app: &mut CsvApp) {
+        let ctx = egui::Context::default();
+        for _ in 0..500 {
+            app.poll_saving(&ctx);
+            if app.saving.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the save never ended");
+    }
+
+    #[test]
+    fn edits_made_while_saving_stay_unsaved() {
+        let dir = std::env::temp_dir().join(format!("csvedit-app-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a test folder");
+        let path = dir.join("a.csv");
+        let mut app = CsvApp::new(None);
+        app.commit(Edit::SetCells(vec![(0, 0, "saved".into())]));
+        app.save_to(&path, None, true);
+        // Typed while the file is written: not in it.
+        app.commit(Edit::SetCells(vec![(0, 0, "later".into())]));
+        // Asked for meanwhile: waits for the save.
+        app.run(Command::New);
+        assert!(app.pending.is_none());
+        finish_saving(&mut app);
+        let text = std::fs::read_to_string(&path).expect("saved");
+        assert!(text.starts_with("saved,"), "{text:?}");
+        assert_eq!(app.path.as_deref(), Some(path.as_path()));
+        assert!(app.dirty());
+        // The queued New asks about the newer change.
+        assert!(matches!(app.pending, Some(Pending::New)));
+        app.pending = None;
+        app.undo();
+        assert!(!app.dirty());
+        assert_eq!(app.table.cell(0, 0), "saved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edit_after_undoing_past_the_save_start_stays_dirty() {
+        let dir = std::env::temp_dir().join(format!("csvedit-app-undo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a test folder");
+        let path = dir.join("a.csv");
+        let mut app = CsvApp::new(None);
+        app.commit(Edit::SetCells(vec![(0, 0, "saved".into())]));
+        app.save_to(&path, None, true);
+        app.undo();
+        app.commit(Edit::SetCells(vec![(0, 0, "other".into())]));
+        finish_saving(&mut app);
+        // The state saved can no longer be reached by undoing.
+        assert_eq!(app.saved_depth, None);
+        assert!(app.dirty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn finds_and_cycles_through_matches() {
         let mut app = CsvApp::new(None);
@@ -1565,13 +2226,133 @@ mod tests {
         app.selected = (0, 0);
         app.next_match(false);
         assert_eq!(app.matches()[0], (0, 0));
-        let second = app.matches()[1];
-        assert_eq!(app.selected, second);
+        let (row, col) = app.matches()[1];
+        assert_eq!(app.selected, (row as usize, col as usize));
         app.next_match(true);
         app.next_match(true);
-        let last = *app.matches().last().expect("matches");
-        assert_eq!(app.selected, last);
+        let (row, col) = *app.matches().last().expect("matches");
+        assert_eq!(app.selected, (row as usize, col as usize));
         assert!(count > 3);
+    }
+
+    #[test]
+    fn finds_ignoring_case() {
+        for (text, needle, found) in [
+            ("Lyon", "ly", true),
+            ("lyON", "on", true),
+            ("Lyon", "yo", true),
+            ("Lyon", "lyonn", false),
+            ("2024-05-01", "05-0", true),
+            ("2024-05-01", "06", false),
+            ("aXbX", "xbx", true),
+            ("", "a", false),
+            ("abc", "", true),
+            ("Évian", "év", true),
+            ("Evian", "év", false),
+        ] {
+            assert_eq!(
+                contains_ignoring_case(text, needle),
+                found,
+                "{text} {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn counts_characters_as_seen() {
+        assert_eq!(grapheme_count("abc"), 3);
+        assert_eq!(grapheme_count("a\r\nb\rc\n"), 6);
+        assert_eq!(grapheme_count("e\u{301}t\u{e9}"), 3);
+        assert_eq!(grapheme_count(""), 0);
+    }
+
+    #[test]
+    fn keeps_column_stats_up_to_date_through_edits() {
+        let mut app = CsvApp::new(None);
+        let (table, format) = table::parse(b"Name;City\nLyon;Paris\nNice;\nAix;Marseille\n");
+        app.reset(table, format, None);
+        app.header = true;
+        // What working them out again finds, to compare with.
+        let fresh = |app: &mut CsvApp| {
+            app.column_stats = None;
+            let s = app.column_stats(1);
+            (s.filled, s.empty, s.longest)
+        };
+        let stats = |app: &mut CsvApp| {
+            let s = app.column_stats(1);
+            (s.filled, s.empty, s.longest)
+        };
+        assert_eq!(stats(&mut app), (2, 1, 9));
+        let edits = [
+            // Filled, longer.
+            vec![(2, 1, Cell::from("Montpellier"))],
+            // The longest one shorter: worked out again.
+            vec![(2, 1, Cell::from("Nice"))],
+            // Emptied, the same cell twice, another column, the header.
+            vec![
+                (1, 1, Cell::from(" ")),
+                (3, 1, Cell::from("x")),
+                (3, 1, Cell::from("Marseilles")),
+                (1, 0, Cell::from("Lille")),
+                (0, 1, Cell::from("A very long title")),
+            ],
+        ];
+        for (i, edit) in edits.into_iter().enumerate() {
+            app.commit(Edit::SetCells(edit));
+            let in_place = app.column_stats.is_some_and(|(g, ..)| g == app.generation);
+            assert_eq!(in_place, i != 1, "edit {i}");
+            let followed = stats(&mut app);
+            assert_eq!(followed, fresh(&mut app));
+            app.undo();
+            let followed = stats(&mut app);
+            assert_eq!(followed, fresh(&mut app));
+            app.redo();
+            stats(&mut app);
+        }
+        assert_eq!(stats(&mut app), (2, 1, 10));
+        app.run(Command::DeleteRow);
+        assert_eq!(stats(&mut app), fresh(&mut app));
+    }
+
+    #[test]
+    fn keeps_matches_up_to_date_through_edits() {
+        let mut app = CsvApp::new(None);
+        let (table, format) = table::parse(b"Name;City\nLyon;Paris\nNice;Lyon\n");
+        app.reset(table, format, None);
+        // What a full search finds, to compare with.
+        let fresh = |app: &mut CsvApp| {
+            app.matches.clear();
+            app.matches().to_vec()
+        };
+        app.find = "ly".into();
+        assert_eq!(app.matches(), [(1, 0), (2, 1)]);
+        app.commit(Edit::SetCells(vec![
+            (1, 1, Cell::from("Lyon 3e")),
+            (1, 0, Cell::from("Nantes")),
+        ]));
+        assert_eq!(app.matches(), [(1, 1), (2, 1)]);
+        assert_eq!(fresh(&mut app), [(1, 1), (2, 1)]);
+        assert!(app.is_match(1, 1) && !app.is_match(1, 0));
+        app.undo();
+        assert_eq!(app.matches(), [(1, 0), (2, 1)]);
+        app.redo();
+        assert_eq!(app.matches(), [(1, 1), (2, 1)]);
+        // Typing on keeps only the cells that still hold the text.
+        app.find = "lyon 3".into();
+        assert_eq!(app.matches(), [(1, 1)]);
+        assert_eq!(fresh(&mut app), [(1, 1)]);
+        // In the order the columns are shown.
+        app.find = "n".into();
+        app.show_columns(vec![1, 0]);
+        assert_eq!(app.matches(), [(0, 0), (1, 1), (1, 0), (2, 1), (2, 0)]);
+        assert!(app.is_match(1, 0) && app.is_match(2, 0));
+        app.commit(Edit::SetCells(vec![(1, 0, Cell::from("Paris"))]));
+        assert_eq!(app.matches(), [(0, 0), (1, 1), (2, 1), (2, 0)]);
+        assert_eq!(fresh(&mut app), [(0, 0), (1, 1), (2, 1), (2, 0)]);
+        // A hidden column is not searched.
+        app.show_columns(vec![1]);
+        assert_eq!(app.matches(), [(1, 1), (2, 1)]);
+        assert!(!app.is_match(2, 0));
     }
 
     const DEMO_CSV: &str = "Name;City;Age;Notes\nDupont;\"Paris; 5e\";42;A rather long note that does not fit in its column<BR>with a second line\nMartin;Lyon;7;\nBérard;Nantes;19;\"Two\nlines\"\n";
@@ -1600,7 +2381,8 @@ AN-1052;House;Tresses;33370;5;128;468000;Contemporary house, pool, three bedroom
     /// text is found; `CSVEDIT_COLUMNS` lists the columns shown,
     /// `CSVEDIT_LABELS` names them (`one`, `zero`), `CSVEDIT_CHOOSER` opens
     /// the column chooser; with `CSVEDIT_IMPORT`, the import window is open
-    /// (`poliris`: on a Poliris file, `xlsx`: on a workbook); `CSVEDIT_DEMO` shows the website's
+    /// (`poliris`: on a Poliris file, `xlsx`: on a workbook); with
+    /// `CSVEDIT_DIAG`, the Diagnostics window; `CSVEDIT_DEMO` shows the website's
     /// made-up listing of homes.
     #[test]
     #[ignore = "needs a graphics renderer"]
@@ -1658,6 +2440,7 @@ AN-1052;House;Tresses;33370;5;128;468000;Contemporary house, pool, three bedroom
                     };
                     app.import = Some(ImportDialog::new(name.into(), bytes, true));
                 }
+                app.diagnostics.open = std::env::var("CSVEDIT_DIAG").is_ok();
                 if std::env::var("CSVEDIT_EDIT").is_ok() {
                     app.selected = (2, 1);
                     app.start_editing("Lyon 3e".into(), false);

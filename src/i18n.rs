@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fluent_bundle::concurrent::FluentBundle;
-use fluent_bundle::{FluentArgs, FluentResource};
+use fluent_bundle::{FluentArgs, FluentResource, FluentValue};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lang {
@@ -50,6 +50,15 @@ impl Lang {
         Lang::ALL.into_iter().find(|l| l.code() == primary)
     }
 
+    /// What goes between each group of three digits: a narrow no-break
+    /// space in French, a comma in English.
+    fn thousands(self) -> &'static str {
+        match self {
+            Lang::En => ",",
+            Lang::Fr => "\u{202f}",
+        }
+    }
+
     fn index(self) -> usize {
         Lang::ALL
             .iter()
@@ -69,10 +78,66 @@ fn bundle(lang: Lang) -> FluentBundle<FluentResource> {
     // No Unicode isolation marks around values: egui's fonts show them as
     // empty boxes.
     bundle.set_use_isolating(false);
+    // Counts with their thousands separators ("240,567", "240 567").
+    match lang {
+        Lang::En => bundle.set_formatter(Some(format_number::<En, _>)),
+        Lang::Fr => bundle.set_formatter(Some(format_number::<Fr, _>)),
+    }
     // Syntax errors are caught by the tests; whatever parses is kept.
     let resource = FluentResource::try_new(lang.source().to_owned()).unwrap_or_else(|(r, _)| r);
     let _ = bundle.add_resource(resource);
     bundle
+}
+
+/// The languages as types, for the bundles' formatters (plain functions).
+trait Language {
+    const LANG: Lang;
+}
+struct En;
+struct Fr;
+impl Language for En {
+    const LANG: Lang = Lang::En;
+}
+impl Language for Fr {
+    const LANG: Lang = Lang::Fr;
+}
+
+/// A whole number given to a message, written with the language's
+/// thousands separators; anything else as Fluent writes it.
+fn format_number<L: Language, M>(value: &FluentValue, _: &M) -> Option<String> {
+    let FluentValue::Number(number) = value else {
+        return None;
+    };
+    let whole = number.value.fract() == 0.0 && number.value.abs() < 9e15;
+    let plain = number.options.minimum_fraction_digits.is_none()
+        && number.options.minimum_integer_digits.is_none();
+    (whole && plain && number.options.use_grouping).then(|| {
+        let digits = grouped_in(number.value.abs() as u64, L::LANG);
+        if number.value < 0.0 {
+            format!("-{digits}")
+        } else {
+            digits
+        }
+    })
+}
+
+/// `n` with the chosen language's thousands separators, for counts shown
+/// outside messages.
+pub fn number(n: impl Into<u64>) -> String {
+    grouped_in(n.into(), lang())
+}
+
+/// `n` with `lang`'s thousands separators.
+fn grouped_in(n: u64, lang: Lang) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 * 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push_str(lang.thousands());
+        }
+        out.push(digit);
+    }
+    out
 }
 
 pub fn lang() -> Lang {
@@ -294,6 +359,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn groups_thousands() {
+        assert_eq!(grouped_in(0, Lang::En), "0");
+        assert_eq!(grouped_in(999, Lang::En), "999");
+        assert_eq!(grouped_in(1000, Lang::En), "1,000");
+        assert_eq!(grouped_in(240_567, Lang::En), "240,567");
+        assert_eq!(grouped_in(3_608_505, Lang::Fr), "3\u{202f}608\u{202f}505");
+        assert_eq!(grouped_in(12_345, Lang::Fr), "12\u{202f}345");
+    }
+
+    #[test]
+    fn messages_group_counts_and_keep_plurals() {
+        let format = |lang: Lang, rows: usize| {
+            let bundle = bundle(lang);
+            let pattern = bundle
+                .get_message("import-data-rows")
+                .and_then(|m| m.value())
+                .expect("import-data-rows");
+            let mut args = FluentArgs::new();
+            args.set("count", rows);
+            bundle
+                .format_pattern(pattern, Some(&args), &mut Vec::new())
+                .into_owned()
+        };
+        assert_eq!(format(Lang::En, 1), "1 data row");
+        assert_eq!(format(Lang::En, 240_567), "240,567 data rows");
+        assert!(format(Lang::Fr, 240_567).starts_with("240\u{202f}567 "));
     }
 
     #[test]

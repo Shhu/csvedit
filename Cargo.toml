@@ -1,6 +1,6 @@
 [package]
 name = "csvedit"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A simple CSV editor"
@@ -9,11 +9,14 @@ build = "build.rs"
 
 [dependencies]
 calamine = "0.38"
+compact_str = "0.10.0"
 eframe = "0.36.2"
 egui-phosphor = "0.14"
-egui_extras = "0.36.2"
+# Character maps of the built-in fonts (already used by egui).
+skrifa = "0.44"
 encoding_rs = "0.8.42"
 fluent-bundle = "0.16"
+memchr = "2.7"
 rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
 sys-locale = "0.3"
 unicode-segmentation = "1"

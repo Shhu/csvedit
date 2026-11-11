@@ -36,13 +36,20 @@ A simple CSV editor, in English and French. Written in Rust with
 - File › Protect Formulas When Saving: cells starting with `=`, `+`, `-` or
   `@` (and not numbers) are written with an apostrophe first, so that a
   spreadsheet opening the CSV file doesn't run them (CSV injection).
+- Fast on large files: a 50 MB, 240,000-row file opens in under 0.1 s
+  and takes about 270 MB; only the cells on screen are drawn, even with
+  thousands of columns; saving and finding run without freezing the window.
+- Help › Diagnostics: a report (memory, timings, frames, recent log, no
+  file names or personal paths) to copy or save when something goes wrong.
 - A single executable on Windows, a Flatpak on Linux.
 
 ## Using it
 
 | Action | Keys |
 | --- | --- |
-| Move | Arrows, Tab, Home, End, Page Up/Down |
+| Move | Arrows, Tab, Home, End, Page Up/Down (by a screenful) |
+| Go to the first or last cell | Ctrl+Home, Ctrl+End |
+| Go to the table's edge | Ctrl+Arrows |
 | Edit the cell | Type, or Enter / F2 / double-click |
 | Validate | Enter (moves down, adds a row at the end), Tab (moves right) |
 | Cancel the typing | Escape |

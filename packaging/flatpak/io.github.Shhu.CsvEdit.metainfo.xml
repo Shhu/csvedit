@@ -46,6 +46,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.2.1" date="2026-11-12">
+      <description>
+        <p>Large files: opening is about five times faster and takes half the memory; only the cells on screen are drawn, so tables with hundreds of columns scroll smoothly; saving runs in the background and finding no longer freezes the window after each edit. Ctrl+Home and Ctrl+End go to the first and last cell, Page Up and Page Down move by a screenful, counts show thousands separators. Fonts for other scripts load only when needed. A new Help › Diagnostics page gives a report to copy or save. Workbook reading gets tighter limits and a time limit.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-11-11">
       <description>
         <p>Opens Excel and LibreOffice workbooks (.xlsx, .xlsm, .xlsb, .xls, .ods): pick the sheet, values only (formulas give their saved result, shown in the inspector), never macros; read apart from the app, so that a damaged or crafted file can't take it down. A new option protects cells that would run as formulas when the CSV file is opened in a spreadsheet.</p>

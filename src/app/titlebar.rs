@@ -112,7 +112,7 @@ impl CsvApp {
             theme::truncated_text(
                 ui,
                 rect,
-                &self.display_name(),
+                self.display_name(),
                 theme::semibold(13.0),
                 p.text,
                 Align::Center,
@@ -257,6 +257,9 @@ impl CsvApp {
             }
         });
         ui.separator();
+        if ui.button(t!("command-diagnostics")).clicked() {
+            self.diagnostics.open = true;
+        }
         if ui.button(t!("command-about")).clicked() {
             self.about = true;
         }

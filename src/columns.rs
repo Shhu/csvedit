@@ -100,7 +100,12 @@ pub fn label(col: usize) -> String {
 pub fn reference(row: usize, col: usize) -> String {
     match labels() {
         Labels::Letters => format!("{}{}", letters(col), row + 1),
-        _ => t!("cell-reference", row = row + 1, col = label(col)),
+        // A reference, not a count: no thousands separators.
+        _ => t!(
+            "cell-reference",
+            row = (row + 1).to_string(),
+            col = label(col)
+        ),
     }
 }
 

@@ -36,6 +36,7 @@ command-delete-col = Supprimer la colonne
 command-sort-ascending = Trier A → Z
 command-sort-descending = Trier Z → A
 command-about = À propos de CSV Edit
+command-diagnostics = Diagnostic…
 header-row = Première ligne en en-tête
 
 ## Window
@@ -83,6 +84,8 @@ table-size = { $rows ->
    *[other] { $cols } colonnes
 }
 selection-one = 1 cellule sélectionnée
+saving = Enregistrement…
+saved = Enregistré
 find-results = { $count ->
     [one] { $count } résultat
    *[other] { $count } résultats
@@ -134,11 +137,16 @@ untitled = Sans titre
 untitled-file = sans titre.csv
 filter-csv = Fichiers CSV
 filter-all = Tous les fichiers
+filter-text = Fichiers texte
 filter-supported = Fichiers CSV et classeurs
 filter-workbooks = Classeurs (Excel, LibreOffice)
 error-open = Impossible d'ouvrir { $file } : { $error }
 error-save = Impossible d'enregistrer { $file } : { $error }
 error-encoding = le caractère « { $character } » ({ $code }) en { $cell } ne peut pas s'écrire en Windows-1252. Modifiez-le, ou choisissez UTF-8 dans la barre d'état.
+error-read-only = le fichier est en lecture seule. Enregistrez-le sous un autre nom, ou rendez-le modifiable d'abord.
+error-save-crashed = l'enregistrement s'est arrêté de façon inattendue. Réessayez, ou enregistrez sous un autre nom.
+error-not-found = le fichier ou son dossier n'existe plus.
+error-permission = l'accès a été refusé. Vérifiez que le fichier et son dossier peuvent être lus et modifiés.
 
 ## Import
 
@@ -148,7 +156,7 @@ import-data-rows = { $count ->
    *[other] { $count } lignes de données
 }
 import-reading = Lecture du fichier…
-import-too-large = trop grand pour être ouvert : { $rows } lignes × { $cols } colonnes
+import-too-large = Trop grand pour être ouvert : { $rows } lignes × { $cols } colonnes
 import-columns = { $count ->
     [one] { $count } colonne
    *[other] { $count } colonnes
@@ -177,11 +185,13 @@ import-invalid = { $count ->
    *[other] { $count } suites d'octets illisibles dans ce jeu de caractères, affichées �
 }
 import-open = Importer
+import-opening = Ouverture…
 import-sheet = Feuille
 import-workbook = Classeur : valeurs seules (les formules donnent leur résultat enregistré), sans macros
-import-workbook-too-large = trop grand pour être ouvert (trop de cellules, ou une partie qui se décompresse trop grande)
-import-workbook-unreadable = ce n'est pas un classeur lisible ({ $error })
-import-workbook-crashed = le fichier n'a pas pu être lu : il est peut-être abîmé
+import-workbook-too-large = Trop grand pour être ouvert (trop de cellules, ou une partie qui se décompresse trop grande)
+import-workbook-unreadable = Ce n'est pas un classeur lisible. Détail : { $error }
+import-workbook-crashed = Le fichier n'a pas pu être lu : il est peut-être abîmé
+import-workbook-timed-out = La lecture du fichier a pris trop de temps (plus de { $minutes } minutes) : il est peut-être abîmé
 
 ## Dialogs
 
@@ -210,3 +220,10 @@ ok = OK
 about-text = Un éditeur simple de fichiers CSV.
 about-license = Logiciel libre sous licence MIT ou Apache-2.0.
 about-third-party = Licences tierces
+diagnostics-title = Diagnostic
+diagnostics-text = Ce que CSV Edit a mesuré et rencontré pendant cette session (et le journal des précédentes), sans noms de fichiers ni chemins personnels. Copiez-le et collez-le à qui vous aide.
+diagnostics-copy = Copier le rapport
+diagnostics-save = Enregistrer…
+diagnostics-close = Fermer
+diagnostics-copied = Copié
+diagnostics-saved = Enregistré

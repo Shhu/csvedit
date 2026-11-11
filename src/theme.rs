@@ -1,7 +1,8 @@
 //! Colors, fonts and widget style, in a dark and a light theme, and the
 //! small painted pieces the interface is made of (icon buttons, chips…).
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Rect,
@@ -173,7 +174,7 @@ pub fn with_icons(text: &str, font: FontId, color: Color32) -> egui::text::Layou
 
 /// Fonts, styles of both themes, and the theme chosen last time.
 pub fn install(ctx: &egui::Context) {
-    ctx.set_fonts(fonts());
+    ctx.set_fonts(fonts(&lock(&SYSTEM)));
     ctx.style_mut_of(Theme::Dark, |s| style(s, &DARK));
     ctx.style_mut_of(Theme::Light, |s| style(s, &LIGHT));
     ctx.set_theme(saved_theme());
@@ -181,9 +182,188 @@ pub fn install(ctx: &egui::Context) {
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
 }
 
+/// The fonts loaded: (name, bytes, from the system).
+static LOADED_FONTS: Mutex<Vec<(String, u64, bool)>> = Mutex::new(Vec::new());
+
+/// The system's fonts read so far (they take megabytes each: only those
+/// of the scripts some text needs), by name.
+static SYSTEM: Mutex<Vec<(String, Arc<FontData>)>> = Mutex::new(Vec::new());
+
+/// The scripts whose system fonts were asked for (`script` bits).
+static REQUESTED: AtomicU16 = AtomicU16::new(0);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The fonts loaded, for the diagnostics.
+pub fn loaded_fonts() -> Vec<(String, u64, bool)> {
+    lock(&LOADED_FONTS).clone()
+}
+
+/// The system's fonts of every script were asked for: no text needs
+/// checking any more.
+pub fn system_fonts_all_requested() -> bool {
+    REQUESTED.load(Ordering::Relaxed) == script::ALL
+}
+
+/// The scripts, one bit each, that the system's fonts are looked for by.
+mod script {
+    pub const HAN: u16 = 1;
+    pub const KANA: u16 = 1 << 1;
+    pub const HANGUL: u16 = 1 << 2;
+    pub const ARABIC: u16 = 1 << 3;
+    pub const HEBREW: u16 = 1 << 4;
+    pub const THAI: u16 = 1 << 5;
+    pub const INDIC: u16 = 1 << 6;
+    /// Anything else (symbols, other scripts).
+    pub const OTHER: u16 = 1 << 7;
+    pub const ALL: u16 = (1 << 8) - 1;
+    pub const CJK: u16 = HAN | KANA | HANGUL;
+
+    pub const NAMES: [(u16, &str); 8] = [
+        (HAN, "Chinese characters"),
+        (KANA, "Japanese kana"),
+        (HANGUL, "Korean"),
+        (ARABIC, "Arabic"),
+        (HEBREW, "Hebrew"),
+        (THAI, "Thai"),
+        (INDIC, "Indian scripts"),
+        (OTHER, "other characters"),
+    ];
+
+    /// The script of `c`, for its fallback font.
+    pub fn of(c: char) -> u16 {
+        match u32::from(c) {
+            0x0590..=0x05FF | 0xFB1D..=0xFB4F => HEBREW,
+            0x0600..=0x06FF | 0x0750..=0x077F | 0x0870..=0x08FF => ARABIC,
+            0xFB50..=0xFDFF | 0xFE70..=0xFEFF => ARABIC,
+            0x0900..=0x0DFF => INDIC,
+            0x0E00..=0x0E7F => THAI,
+            0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7FF => HANGUL,
+            0xFFA0..=0xFFDF => HANGUL,
+            0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF65..=0xFF9F | 0x1B000..=0x1B16F => KANA,
+            0x2E80..=0x2FDF | 0x3000..=0x303F | 0x3100..=0x312F | 0x31A0..=0x31EF => HAN,
+            0x3200..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFE30..=0xFE4F => HAN,
+            0xFF00..=0xFFEF | 0x20000..=0x3FFFF => HAN,
+            _ => OTHER,
+        }
+    }
+
+    /// "Chinese characters, Korean".
+    pub fn names(scripts: u16) -> String {
+        NAMES
+            .iter()
+            .filter(|(bit, _)| scripts & bit != 0)
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The characters the built-in fonts of the interface's text have
+/// (Inter, then egui's fallbacks and emoji, and Phosphor), sorted.
+///
+/// Read from their character maps: egui's `has_glyph` counts the
+/// characters of its replacement font (Noto Emoji, the first with "◻")
+/// as missing.
+static BUILT_IN: LazyLock<Vec<u32>> = LazyLock::new(|| {
+    use skrifa::MetadataProvider as _;
+    let fonts = built_in_fonts();
+    let mut chars: Vec<u32> = fonts.families[&FontFamily::Proportional]
+        .iter()
+        .filter_map(|name| fonts.font_data.get(name))
+        .filter_map(|data| skrifa::FontRef::from_index(&data.font, data.index).ok())
+        .flat_map(|font| {
+            font.charmap()
+                .mappings()
+                .map(|(c, _)| c)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    chars.sort_unstable();
+    chars.dedup();
+    chars
+});
+
+/// The scripts of `texts`' characters that the built-in fonts lack,
+/// leaving out those already asked for.
+pub fn scripts_needed<'a>(texts: impl IntoIterator<Item = &'a str>) -> u16 {
+    scripts_lacking(texts, REQUESTED.load(Ordering::Relaxed))
+}
+
+fn scripts_lacking<'a>(texts: impl IntoIterator<Item = &'a str>, requested: u16) -> u16 {
+    if requested == script::ALL {
+        return 0;
+    }
+    let mut known = requested;
+    for text in texts.into_iter().filter(|text| !text.is_ascii()) {
+        for c in text.chars().filter(|c| !c.is_ascii() && !invisible(*c)) {
+            let script = script::of(c);
+            if known & script == 0 && BUILT_IN.binary_search(&u32::from(c)).is_err() {
+                known |= script;
+                if known == script::ALL {
+                    return known & !requested;
+                }
+            }
+        }
+    }
+    known & !requested
+}
+
+/// Loads the system's fonts for the scripts of `texts`' characters that
+/// the built-in fonts lack (in the background).
+pub fn cover<'a>(ctx: &egui::Context, texts: impl IntoIterator<Item = &'a str>) {
+    load(ctx, scripts_needed(texts));
+}
+
+/// Loads the system's fonts for `scripts`, those not asked for yet, in
+/// the background: reading them takes tens of megabytes at most and
+/// walks the font folders. They are given to egui once read.
+pub fn load(ctx: &egui::Context, scripts: u16) {
+    let new = scripts & !REQUESTED.fetch_or(scripts, Ordering::Relaxed);
+    if new == 0 {
+        return;
+    }
+    crate::diag::log(
+        crate::diag::Level::Info,
+        &format!("loading the system's fonts for {}", script::names(new)),
+    );
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("system fonts".to_owned())
+        .spawn(move || {
+            let found = crate::diag::measure("fonts.system", || read_system_fonts(new));
+            if found.is_empty() {
+                return;
+            }
+            // Held while egui is given the fonts, so that two loads give
+            // it every font.
+            let mut system = lock(&SYSTEM);
+            for (name, data) in found {
+                if !system.iter().any(|(n, _)| *n == name) {
+                    system.push((name, Arc::new(FontData::from_owned(data))));
+                }
+            }
+            ctx.set_fonts(fonts(&system));
+            ctx.request_repaint();
+        });
+    if spawned.is_err() {
+        crate::diag::log(
+            crate::diag::Level::Warning,
+            "couldn't start reading the system's fonts",
+        );
+    }
+}
+
+/// Characters drawn as nothing, which no font needs to have.
+fn invisible(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}')
+}
+
 /// Inter and JetBrains Mono (assets/fonts, OFL), with Phosphor icons and
 /// egui's fonts as fallback.
-fn fonts() -> FontDefinitions {
+fn built_in_fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     let fallback = fonts.families[&FontFamily::Proportional].clone();
@@ -232,89 +412,192 @@ fn fonts() -> FontDefinitions {
         ),
     ];
     fonts.families.extend(families);
-    // Scripts Inter lacks (Chinese, Japanese, Korean, Arabic, Hebrew,
-    // Thai, Indian scripts): from the system's fonts, when it has them.
-    for (name, data) in system_fallbacks() {
-        fonts
-            .font_data
-            .insert(name.clone(), Arc::new(FontData::from_owned(data)));
+    fonts
+}
+
+/// The built-in fonts, then `system`'s for the scripts Inter lacks
+/// (Chinese, Japanese, Korean, Arabic, Hebrew, Thai, Indian scripts).
+fn fonts(system: &[(String, Arc<FontData>)]) -> FontDefinitions {
+    let mut fonts = built_in_fonts();
+    let mut loaded: Vec<(String, u64, bool)> = fonts
+        .font_data
+        .iter()
+        .map(|(name, data)| (name.clone(), data.font.len() as u64, false))
+        .collect();
+    for (name, data) in system {
+        loaded.push((
+            name.trim_start_matches("system-").to_owned(),
+            data.font.len() as u64,
+            true,
+        ));
+        fonts.font_data.insert(name.clone(), Arc::clone(data));
         for family in fonts.families.values_mut() {
             family.push(name.clone());
         }
     }
+    *lock(&LOADED_FONTS) = loaded;
     fonts
 }
 
-/// Fonts of the system covering other scripts, by file name, in order of
-/// preference.
-fn system_fallbacks() -> Vec<(String, Vec<u8>)> {
-    let (dirs, files): (Vec<std::path::PathBuf>, &[&str]) = if cfg!(windows) {
-        let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
-        (
-            vec![std::path::Path::new(&windir).join("Fonts")],
-            &[
-                "segoeui.ttf",
-                "msyh.ttc",
-                "YuGothR.ttc",
-                "malgun.ttf",
-                "Nirmala.ttf",
-                "LeelawUI.ttf",
-            ],
-        )
-    } else {
-        let mut dirs: Vec<std::path::PathBuf> = [
-            "/usr/share/fonts",
-            "/usr/local/share/fonts",
-            // The host's fonts, inside the Flatpak sandbox.
-            "/run/host/fonts",
-            "/run/host/user-fonts",
+/// The system's fonts that may cover other scripts: groups of file
+/// names, the first found of each group taken, and the scripts it is
+/// read for.
+fn system_candidates() -> &'static [(&'static [&'static str], u16)] {
+    use script::*;
+    if cfg!(windows) {
+        &[
+            (&["segoeui.ttf"], OTHER | ARABIC | HEBREW),
+            (&["msyh.ttc"], HAN),
+            (&["YuGothR.ttc"], KANA),
+            (&["malgun.ttf"], HANGUL),
+            (&["Nirmala.ttf"], INDIC),
+            (&["LeelawUI.ttf"], THAI),
         ]
-        .iter()
-        .map(Into::into)
-        .collect();
-        if let Some(home) = std::env::var_os("HOME") {
-            dirs.push(std::path::Path::new(&home).join(".local/share/fonts"));
+    } else {
+        &[
+            (
+                &[
+                    "NotoSansCJK-Regular.ttc",
+                    // Variable fonts (Fedora), read at their default
+                    // instance.
+                    "NotoSansCJK-VF.ttc",
+                    "NotoSansCJK-VF.otf.ttc",
+                    "NotoSansCJKsc-Regular.otf",
+                    "NotoSansCJKsc-VF.otf",
+                    "DroidSansFallbackFull.ttf",
+                    "wqy-microhei.ttc",
+                ],
+                CJK,
+            ),
+            (
+                &[
+                    "NotoSansArabic-Regular.ttf",
+                    "NotoSansArabic[wdth,wght].ttf",
+                ],
+                ARABIC,
+            ),
+            (
+                &[
+                    "NotoSansHebrew-Regular.ttf",
+                    "NotoSansHebrew[wdth,wght].ttf",
+                ],
+                HEBREW,
+            ),
+            (
+                &["NotoSansThai-Regular.ttf", "NotoSansThai[wdth,wght].ttf"],
+                THAI,
+            ),
+            (
+                &[
+                    "NotoSansDevanagari-Regular.ttf",
+                    "NotoSansDevanagari[wdth,wght].ttf",
+                ],
+                INDIC,
+            ),
+            (&["DejaVuSans.ttf"], OTHER | ARABIC | HEBREW),
+        ]
+    }
+}
+
+/// The folders the system's fonts are in.
+fn font_dirs() -> Vec<std::path::PathBuf> {
+    if cfg!(windows) {
+        let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+        return vec![std::path::Path::new(&windir).join("Fonts")];
+    }
+    let mut dirs: Vec<std::path::PathBuf> = [
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        // The host's fonts, inside the Flatpak sandbox.
+        "/run/host/fonts",
+        "/run/host/user-fonts",
+    ]
+    .iter()
+    .map(Into::into)
+    .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(std::path::Path::new(&home).join(".local/share/fonts"));
+    }
+    dirs
+}
+
+/// Where the candidate files are (by lowercase name), found in one walk
+/// of the font folders, the first time.
+fn font_files() -> &'static std::collections::HashMap<String, std::path::PathBuf> {
+    static FILES: std::sync::OnceLock<std::collections::HashMap<String, std::path::PathBuf>> =
+        std::sync::OnceLock::new();
+    FILES.get_or_init(|| {
+        let wanted: std::collections::HashSet<String> = system_candidates()
+            .iter()
+            .flat_map(|(names, _)| names.iter())
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let mut found = std::collections::HashMap::new();
+        for dir in font_dirs() {
+            walk(&dir, 4, &wanted, &mut found);
         }
-        (
-            dirs,
-            &[
-                "NotoSansCJK-Regular.ttc",
-                "NotoSansCJKsc-Regular.otf",
-                "DroidSansFallbackFull.ttf",
-                "wqy-microhei.ttc",
-                "NotoSansArabic-Regular.ttf",
-                "NotoSansHebrew-Regular.ttf",
-                "NotoSansThai-Regular.ttf",
-                "NotoSansDevanagari-Regular.ttf",
-                "DejaVuSans.ttf",
-            ],
-        )
+        found
+    })
+}
+
+/// Notes the `wanted` files in `dir` and its subfolders, `depth` levels
+/// down at most, the shallower first.
+fn walk(
+    dir: &std::path::Path,
+    depth: usize,
+    wanted: &std::collections::HashSet<String>,
+    found: &mut std::collections::HashMap<String, std::path::PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
-    let mut found = Vec::new();
-    for file in files {
-        if let Some(path) = dirs.iter().find_map(|dir| find_file(dir, file, 4))
-            && let Ok(data) = std::fs::read(path)
+    let mut subdirs = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if kind.is_dir() {
+            if depth > 0 {
+                subdirs.push(path);
+            }
+        } else if let Some(name) = entry.file_name().to_str()
+            && wanted.contains(&name.to_ascii_lowercase())
+            && path.is_file()
         {
-            found.push((format!("system-{file}"), data));
+            found.entry(name.to_ascii_lowercase()).or_insert(path);
+        }
+    }
+    subdirs.sort();
+    for subdir in subdirs {
+        walk(&subdir, depth - 1, wanted, found);
+    }
+}
+
+/// The system's fonts for `scripts` not read yet: (name, bytes).
+fn read_system_fonts(scripts: u16) -> Vec<(String, Vec<u8>)> {
+    let files = font_files();
+    let loaded: Vec<String> = lock(&SYSTEM).iter().map(|(n, _)| n.clone()).collect();
+    let mut found = Vec::new();
+    for (names, covers) in system_candidates() {
+        if covers & scripts == 0 {
+            continue;
+        }
+        let Some((file, path)) = names
+            .iter()
+            .find_map(|name| Some((*name, files.get(&name.to_ascii_lowercase())?)))
+        else {
+            continue;
+        };
+        let name = format!("system-{file}");
+        if loaded.contains(&name) || found.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if let Ok(data) = std::fs::read(path) {
+            found.push((name, data));
         }
     }
     found
-}
-
-/// `name` in `dir` or its subfolders, `depth` levels down at most.
-fn find_file(dir: &std::path::Path, name: &str, depth: usize) -> Option<std::path::PathBuf> {
-    let direct = dir.join(name);
-    if direct.is_file() {
-        return Some(direct);
-    }
-    if depth == 0 {
-        return None;
-    }
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .find_map(|e| find_file(&e.path(), name, depth - 1))
 }
 
 fn style(style: &mut egui::Style, p: &Palette) {
@@ -603,6 +886,25 @@ pub fn modal(id: &str, ctx: &egui::Context) -> egui::Modal {
         )
 }
 
+/// `key` was pressed, for the dialog `ui` is in, when it is the topmost
+/// one: the key is then taken, so that a dialog under it doesn't get it
+/// too.
+pub fn dialog_key(ui: &egui::Ui, key: egui::Key) -> bool {
+    let top = ui.ctx().memory(|m| m.top_modal_layer()) == Some(ui.layer_id());
+    top && ui
+        .ctx()
+        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, key))
+}
+
+/// The largest size a dialog's frame (its margins in) may take: the
+/// window less a margin around it, and at most `max`.
+pub fn dialog_room(ctx: &egui::Context, max: egui::Vec2) -> egui::Vec2 {
+    let screen = ctx.content_rect().size();
+    (screen - egui::vec2(32.0, 32.0))
+        .max(egui::vec2(200.0, 120.0))
+        .min(max)
+}
+
 /// Paints `text` anchored at `pos`, on whole pixels (sharper).
 pub fn paint_text(
     painter: &egui::Painter,
@@ -636,12 +938,12 @@ pub fn paint_galley(
 pub fn truncated_text(
     ui: &egui::Ui,
     rect: Rect,
-    text: &str,
+    text: impl Into<String>,
     font: FontId,
     color: Color32,
     align: egui::Align,
 ) -> bool {
-    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    let mut job = egui::text::LayoutJob::simple_singleline(text.into(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width().max(0.0));
     let galley = ui.painter().layout_job(job);
     let truncated = galley.elided;
@@ -653,4 +955,57 @@ pub fn truncated_text(
     let pos = egui::pos2(x, rect.center().y - galley.size().y / 2.0);
     paint_galley(&ui.painter().with_clip_rect(rect), pos, galley, color);
     truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::script::{self, *};
+
+    #[test]
+    fn system_fonts_wait_for_text_that_needs_them() {
+        let lacking = |texts: &[&str]| super::scripts_lacking(texts.iter().copied(), 0);
+        // Accents, Greek, Cyrillic, emoji (Noto Emoji, egui's) are built in.
+        assert_eq!(
+            lacking(&[
+                "plain",
+                "café, Ελλάδα, Москва, 25 €",
+                "\u{FEFF}x",
+                "👍 😀 ✅"
+            ]),
+            0
+        );
+        assert_eq!(lacking(&["東京"]), HAN);
+        assert_eq!(lacking(&["東京", "ひらがな", "서울"]), HAN | KANA | HANGUL);
+        assert_eq!(lacking(&["שלום", "مرحبا"]), HEBREW | ARABIC);
+        // Scripts already asked for are left out.
+        assert_eq!(super::scripts_lacking(["東京 ไทย"], HAN), THAI);
+        assert_eq!(super::scripts_lacking(["東京"], script::ALL), 0);
+    }
+
+    #[test]
+    fn characters_belong_to_their_script() {
+        for (c, s) in [
+            ('東', HAN),
+            ('。', HAN),
+            ('あ', KANA),
+            ('ｱ', KANA),
+            ('한', HANGUL),
+            ('ש', HEBREW),
+            ('ش', ARABIC),
+            ('ก', THAI),
+            ('क', INDIC),
+            ('ᚠ', OTHER),
+        ] {
+            assert_eq!(script::of(c), s, "{c}");
+        }
+        assert_eq!(script::names(HAN | THAI), "Chinese characters, Thai");
+    }
+
+    #[test]
+    fn each_script_has_a_candidate_font() {
+        let covered = super::system_candidates()
+            .iter()
+            .fold(0, |all, (_, scripts)| all | scripts);
+        assert_eq!(covered, script::ALL);
+    }
 }

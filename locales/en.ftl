@@ -36,6 +36,7 @@ command-delete-col = Delete Column
 command-sort-ascending = Sort A → Z
 command-sort-descending = Sort Z → A
 command-about = About CSV Edit
+command-diagnostics = Diagnostics…
 header-row = First Row Is Header
 
 ## Window
@@ -80,6 +81,8 @@ table-size = { $rows ->
    *[other] { $cols } columns
 }
 selection-one = 1 cell selected
+saving = Saving…
+saved = Saved
 find-results = { $count ->
     [one] { $count } match
    *[other] { $count } matches
@@ -134,11 +137,16 @@ untitled = Untitled
 untitled-file = untitled.csv
 filter-csv = CSV files
 filter-all = All files
+filter-text = Text files
 filter-supported = CSV files and workbooks
 filter-workbooks = Workbooks (Excel, LibreOffice)
 error-open = Couldn't open { $file }: { $error }
 error-save = Couldn't save { $file }: { $error }
 error-encoding = the character "{ $character }" ({ $code }) in { $cell } can't be written in Windows-1252. Change it, or choose UTF-8 in the status bar.
+error-read-only = the file is read-only. Save it under another name, or make it writable first.
+error-save-crashed = the saving stopped unexpectedly. Try again, or save under another name.
+error-not-found = the file or its folder no longer exists.
+error-permission = access was refused. Check that the file and its folder can be read and written.
 
 ## Import
 
@@ -148,7 +156,7 @@ import-data-rows = { $count ->
    *[other] { $count } data rows
 }
 import-reading = Reading the file…
-import-too-large = too large to open: { $rows } rows × { $cols } columns
+import-too-large = Too large to open: { $rows } rows × { $cols } columns
 import-columns = { $count ->
     [one] { $count } column
    *[other] { $count } columns
@@ -177,11 +185,13 @@ import-invalid = { $count ->
    *[other] { $count } byte sequences can't be read in this character set and will show as �
 }
 import-open = Import
+import-opening = Opening…
 import-sheet = Sheet
 import-workbook = Workbook: values only (formulas give their saved result), no macros
-import-workbook-too-large = too large to open (too many cells, or a part that unzips too large)
-import-workbook-unreadable = not a workbook that can be read ({ $error })
-import-workbook-crashed = the file couldn't be read: it may be damaged
+import-workbook-too-large = Too large to open (too many cells, or a part that unzips too large)
+import-workbook-unreadable = Not a workbook that can be read. Details: { $error }
+import-workbook-crashed = The file couldn't be read: it may be damaged
+import-workbook-timed-out = The file took too long to read (over { $minutes } minutes): it may be damaged
 
 ## Dialogs
 
@@ -210,3 +220,10 @@ ok = OK
 about-text = A simple editor for CSV files.
 about-license = Free software under the MIT or Apache-2.0 license.
 about-third-party = Third-Party Licenses
+diagnostics-title = Diagnostics
+diagnostics-text = What CSV Edit measured and met during this session (and the earlier ones' log), without file names or personal paths. Copy it and paste it to whoever helps you.
+diagnostics-copy = Copy the Report
+diagnostics-save = Save…
+diagnostics-close = Close
+diagnostics-copied = Copied
+diagnostics-saved = Saved

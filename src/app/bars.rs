@@ -10,6 +10,9 @@ use super::*;
 use crate::i18n::t;
 use crate::theme::{self, palette};
 
+/// Characters of the search shown in the status bar, at most.
+const FIND_SHOWN: usize = 24;
+
 /// The toolbar's icons that Phosphor lacks, drawn like the others.
 #[derive(Clone, Copy)]
 enum TableIcon {
@@ -206,7 +209,7 @@ impl CsvApp {
         );
         right = key_rect.left() - 8.0;
         if !self.needle().is_empty() {
-            let count = self.matches().len();
+            let count = self.match_count();
             let chip = ui.painter().layout_no_wrap(
                 t!("find-count", count = count),
                 theme::semibold(12.0),
@@ -276,7 +279,7 @@ impl CsvApp {
                 if theme::truncated_text(
                     ui,
                     rect,
-                    &flat_text(&title),
+                    flat_text(&title),
                     theme::regular(12.0),
                     p.faint,
                     Align::Min,
@@ -300,110 +303,172 @@ impl CsvApp {
     }
 
     pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let p = palette(ui);
-        let (row, col) = self.selected;
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
-            ui.label(
-                egui::RichText::new(columns::reference(row, col))
-                    .font(theme::mono_semibold(12.0))
-                    .color(p.accent_ink),
-            );
-            let small = |text: String| egui::RichText::new(text).size(12.0).color(p.muted);
-            ui.label(small(t!(
-                "table-size",
-                rows = self.table.row_count(),
-                cols = self.table.col_count()
-            )));
-            theme::dot(ui);
-            ui.label(small(t!("selection-one")));
-            if !self.needle().is_empty() {
-                let count = self.matches().len();
-                theme::dot(ui);
-                ui.label(small(t!(
-                    "find-results",
-                    count = count,
-                    text = self.find.trim().to_owned()
-                )));
-            }
-            if let Some(shown) = &self.shown {
-                theme::dot(ui);
-                ui.label(small(t!(
-                    "columns-shown",
-                    shown = shown.len(),
-                    count = self.table.col_count()
-                )));
-            }
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                let ending = self.format.line_ending;
-                selector(ui, None, line_ending_name(ending), None, |ui| {
-                    for (ending, key) in [
-                        (LineEnding::Lf, t!("line-ending-lf")),
-                        (LineEnding::CrLf, t!("line-ending-crlf")),
-                        (LineEnding::Cr, t!("line-ending-cr")),
-                    ] {
-                        ui.selectable_value(&mut self.format.line_ending, ending, key);
-                    }
-                });
-                theme::vertical_separator(ui, 14.0);
-                let encoding = self.format.encoding;
-                selector(ui, None, &encoding_name(encoding), None, |ui| {
-                    for encoding in Encoding::ALL {
-                        ui.selectable_value(
-                            &mut self.format.encoding,
-                            encoding,
-                            encoding_name(encoding),
-                        );
-                    }
-                });
-                theme::vertical_separator(ui, 14.0);
-                let custom = !table::DELIMITERS.contains(&self.format.delimiter.as_str());
-                if custom {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.custom_delimiter)
-                            .font(theme::mono(12.0))
-                            .desired_width(36.0)
-                            .char_limit(8),
-                    );
-                    if response.changed() && !self.custom_delimiter.is_empty() {
-                        self.format.delimiter = self.custom_delimiter.clone();
-                    } else if !response.has_focus() {
-                        self.custom_delimiter = self.format.delimiter.clone();
-                    }
-                }
-                let delimiter = self.format.delimiter.clone();
-                let glyph = (!custom).then(|| delimiter_glyph(&delimiter));
-                selector(
-                    ui,
-                    Some(&t!("delimiter")),
-                    &delimiter_name(&delimiter),
-                    glyph.as_deref(),
-                    |ui| {
-                        for delimiter in table::DELIMITERS {
-                            ui.selectable_value(
-                                &mut self.format.delimiter,
-                                delimiter.to_owned(),
-                                format!(
-                                    "{}  {}",
-                                    delimiter_name(delimiter),
-                                    delimiter_glyph(delimiter)
-                                ),
-                            );
-                        }
-                        if ui.selectable_label(custom, t!("delimiter-other")).clicked() && !custom {
-                            if self.custom_delimiter.is_empty()
-                                || table::DELIMITERS.contains(&self.custom_delimiter.as_str())
-                            {
-                                self.custom_delimiter = "#".to_owned();
-                            }
-                            self.format.delimiter = self.custom_delimiter.clone();
-                        }
-                    },
-                );
+        // The selectors on the right first; the labels get what is left,
+        // so that they never run under them.
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            self.status_selectors(ui);
+            ui.add_space(12.0);
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let room = ui.max_rect().intersect(ui.clip_rect());
+                ui.set_clip_rect(room);
+                self.status_labels(ui);
             });
         });
+    }
+
+    /// The selected cell, the table's size, the search's results… Labels
+    /// that don't fit are cut short ("…"); "1 cell selected" goes first.
+    fn status_labels(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        let (row, col) = self.selected;
+        ui.spacing_mut().item_spacing.x = 12.0;
+        let mut labels = vec![t!(
+            "table-size",
+            rows = self.table.row_count(),
+            cols = self.table.col_count()
+        )];
+        let selection = t!("selection-one");
+        if !self.needle().is_empty() {
+            let count = self.match_count();
+            labels.push(t!(
+                "find-results",
+                count = count,
+                text = capped(self.find.trim(), FIND_SHOWN).into_owned()
+            ));
+        }
+        if let Some(shown) = &self.shown {
+            labels.push(t!(
+                "columns-shown",
+                shown = shown.len(),
+                count = self.table.col_count()
+            ));
+        }
+        let reference = columns::reference(row, col);
+        // Each label after the first comes after a dot and two gaps.
+        let width = |text: &str, font: FontId| {
+            ui.painter()
+                .layout_no_wrap(text.to_owned(), font, p.muted)
+                .size()
+                .x
+                + 27.0
+        };
+        let needed: f32 = width(&reference, theme::mono_semibold(12.0))
+            + width(&selection, theme::regular(12.0))
+            + labels
+                .iter()
+                .map(|l| width(l, theme::regular(12.0)))
+                .sum::<f32>();
+        if needed <= ui.available_width() {
+            labels.insert(1, selection);
+        }
+        let small = |text: String| egui::RichText::new(text).size(12.0).color(p.muted);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(reference)
+                    .font(theme::mono_semibold(12.0))
+                    .color(p.accent_ink),
+            )
+            .truncate(),
+        );
+        for (i, label) in labels.into_iter().enumerate() {
+            if ui.available_width() <= 0.0 {
+                break;
+            }
+            if i > 0 {
+                theme::dot(ui);
+            }
+            ui.add(egui::Label::new(small(label)).truncate());
+        }
+        if ui.available_width() <= 0.0 {
+            return;
+        }
+        if self.saving.is_some() {
+            theme::dot(ui);
+            ui.add(egui::Spinner::new().size(12.0).color(p.muted));
+            ui.add(egui::Label::new(small(t!("saving"))).truncate());
+        } else if let Some(at) = self.saved_at {
+            let left = SAVED_NOTICE.saturating_sub(at.elapsed());
+            if left.is_zero() {
+                self.saved_at = None;
+            } else {
+                theme::dot(ui);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(t!("saved"))
+                            .size(12.0)
+                            .color(p.accent_ink),
+                    )
+                    .truncate(),
+                );
+                ui.ctx().request_repaint_after(left);
+            }
+        }
+    }
+
+    /// Line ending, encoding and delimiter, from the right.
+    fn status_selectors(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let ending = self.format.line_ending;
+        selector(ui, None, line_ending_name(ending), None, |ui| {
+            for (ending, key) in [
+                (LineEnding::Lf, t!("line-ending-lf")),
+                (LineEnding::CrLf, t!("line-ending-crlf")),
+                (LineEnding::Cr, t!("line-ending-cr")),
+            ] {
+                ui.selectable_value(&mut self.format.line_ending, ending, key);
+            }
+        });
+        theme::vertical_separator(ui, 14.0);
+        let encoding = self.format.encoding;
+        selector(ui, None, &encoding_name(encoding), None, |ui| {
+            for encoding in Encoding::ALL {
+                ui.selectable_value(&mut self.format.encoding, encoding, encoding_name(encoding));
+            }
+        });
+        theme::vertical_separator(ui, 14.0);
+        let custom = !table::DELIMITERS.contains(&self.format.delimiter.as_str());
+        if custom {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.custom_delimiter)
+                    .font(theme::mono(12.0))
+                    .desired_width(36.0)
+                    .char_limit(8),
+            );
+            if response.changed() && !self.custom_delimiter.is_empty() {
+                self.format.delimiter = self.custom_delimiter.clone();
+            } else if !response.has_focus() {
+                self.custom_delimiter = self.format.delimiter.clone();
+            }
+        }
+        let delimiter = self.format.delimiter.clone();
+        let glyph = (!custom).then(|| delimiter_glyph(&delimiter));
+        selector(
+            ui,
+            Some(&t!("delimiter")),
+            &delimiter_name(&delimiter),
+            glyph.as_deref(),
+            |ui| {
+                for delimiter in table::DELIMITERS {
+                    ui.selectable_value(
+                        &mut self.format.delimiter,
+                        delimiter.to_owned(),
+                        format!(
+                            "{}  {}",
+                            delimiter_name(delimiter),
+                            delimiter_glyph(delimiter)
+                        ),
+                    );
+                }
+                if ui.selectable_label(custom, t!("delimiter-other")).clicked() && !custom {
+                    if self.custom_delimiter.is_empty()
+                        || table::DELIMITERS.contains(&self.custom_delimiter.as_str())
+                    {
+                        self.custom_delimiter = "#".to_owned();
+                    }
+                    self.format.delimiter = self.custom_delimiter.clone();
+                }
+            },
+        );
     }
 }
 
@@ -513,7 +578,12 @@ impl CsvApp {
         let count = self.shown.as_ref().map(Vec::len);
         let response = match count {
             Some(n) => {
-                let text = format!("{}  {n} / {total}", icon::COLUMNS);
+                let text = format!(
+                    "{}  {} / {}",
+                    icon::COLUMNS,
+                    crate::i18n::number(n as u64),
+                    crate::i18n::number(total as u64)
+                );
                 let galley = ui.painter().layout_job(theme::with_icons(
                     &text,
                     theme::semibold(12.0),

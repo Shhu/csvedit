@@ -11,14 +11,19 @@ use eframe::egui::{
 use egui_phosphor::regular as icon;
 
 use crate::app::{delimiter_glyph, delimiter_name, encoding_name, flat_text, line_ending_name};
+use crate::cancel::Cancel;
 use crate::columns;
 use crate::i18n::t;
-use crate::table::{self, Encoding, Format, ImportOptions, Imported, Preview, Table, TooLarge};
+use crate::table::{
+    self, Cell, Encoding, Format, ImportOptions, Imported, Preview, Stop, Table, TooLarge,
+};
 use crate::theme::{self, Palette, palette};
 use crate::workbook::{self, WorkbookError};
 
-/// Width of the window.
+/// Width of the window, at most (less in a smaller window).
 const WIDTH: f32 = 820.0;
+/// Height of the footer, with its line.
+const FOOTER: f32 = 65.0;
 /// Room on each side of its content.
 const SIDE: f32 = 24.0;
 /// Preview: rows shown at most, row height, column width, rows visible
@@ -33,6 +38,13 @@ const PREVIEW_VISIBLE: f32 = 8.0;
 const SETTLE: f64 = 0.3;
 
 pub enum Outcome {
+    /// The file read with the chosen options.
+    Open(Box<Imported>),
+    Cancel,
+}
+
+/// A footer button clicked.
+enum Choice {
     Open,
     Cancel,
 }
@@ -57,6 +69,16 @@ pub struct ImportDialog {
     other_focused: bool,
     /// A workbook: the sheets found so far, and the one chosen.
     workbook: Option<(Vec<String>, usize)>,
+    /// Import was chosen before the reading ended: it opens once the
+    /// reading is done. Since when.
+    opening: Option<std::time::Instant>,
+    /// What the fonts were last checked for: (what is read, whether its
+    /// result had come, the "Other" field).
+    fonts_checked: Option<(ReadKey, bool, String)>,
+    /// The window's width this frame: `WIDTH`, or less to fit.
+    width: f32,
+    /// The preview's columns scrolled into view last frame, if drawn.
+    preview_cols: Option<std::ops::Range<usize>>,
 }
 
 /// Why a file can't be opened.
@@ -78,6 +100,20 @@ struct Reading {
     key: ReadKey,
     receiver: mpsc::Receiver<Result<Imported, OpenError>>,
     result: Option<Result<Imported, OpenError>>,
+    /// Stops the reading once it is no longer wanted.
+    cancel: Cancel,
+}
+
+impl Drop for Reading {
+    /// A reading for earlier options stops (its reader process is
+    /// killed), and a table read is freed away from the interface's
+    /// thread.
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(result) = self.result.take() {
+            std::thread::spawn(move || drop(result));
+        }
+    }
 }
 
 impl ImportDialog {
@@ -130,6 +166,10 @@ impl ImportDialog {
             changed_at: f64::NEG_INFINITY,
             other_focused: false,
             workbook: None,
+            opening: None,
+            fonts_checked: None,
+            width: WIDTH,
+            preview_cols: None,
         }
     }
 
@@ -154,12 +194,24 @@ impl ImportDialog {
         }
     }
 
-    /// Reads now what `key` says.
-    fn read(path: &std::path::Path, bytes: &[u8], key: &ReadKey) -> Result<Imported, OpenError> {
-        match key {
-            ReadKey::Text(options) => table::import(bytes, options).map_err(OpenError::TooLarge),
+    /// Reads now what `key` says; `None` once `cancel` stops it.
+    fn read(
+        path: &std::path::Path,
+        bytes: &[u8],
+        key: &ReadKey,
+        cancel: &Cancel,
+    ) -> Option<Result<Imported, OpenError>> {
+        let mut imported = match key {
+            ReadKey::Text(options) => match table::import_until(bytes, options, cancel.flag()) {
+                Ok(imported) => imported,
+                Err(Stop::Cancelled) => return None,
+                Err(Stop::TooLarge(too_large)) => return Some(Err(OpenError::TooLarge(too_large))),
+            },
             ReadKey::Sheet(sheet) => {
-                let book = workbook::read(path, *sheet).map_err(OpenError::Workbook)?;
+                let book = match workbook::read(path, *sheet, cancel)? {
+                    Ok(book) => book,
+                    Err(error) => return Some(Err(OpenError::Workbook(error))),
+                };
                 let table = if book.rows.is_empty() {
                     Table::default()
                 } else {
@@ -176,34 +228,33 @@ impl ImportDialog {
                     encoding: Encoding::Utf8Bom,
                     ..Format::default()
                 };
-                Ok(Imported {
+                Imported {
                     table,
                     format,
                     losses: table::Losses::default(),
                     formulas: book.formulas,
                     sheets: book.sheets,
-                })
+                    rare_chars: String::new(),
+                }
             }
+        };
+        // Looked for here rather than on the interface's thread once opened.
+        if !crate::theme::system_fonts_all_requested() {
+            imported.rare_chars = imported.table.rare_chars();
         }
+        Some(Ok(imported))
     }
 
-    /// The file read with the chosen options: the background reading if it
-    /// is done or under way with them, else read now.
-    pub fn into_imported(mut self) -> Result<Imported, OpenError> {
-        let key = self.key();
-        match self.reading.take() {
-            Some(Reading {
-                key: k,
-                result: Some(result),
-                ..
-            }) if k == key => result,
-            Some(Reading {
-                key: k, receiver, ..
-            }) if k == key => receiver
-                .recv()
-                .unwrap_or_else(|_| Self::read(&self.path, &self.bytes, &key)),
-            _ => Self::read(&self.path, &self.bytes, &key),
-        }
+    /// How long Import waited for the reading to end.
+    pub fn waited(&self) -> std::time::Duration {
+        self.opening
+            .map_or_else(Default::default, |since| since.elapsed())
+    }
+
+    /// The background reading's result for what is shown, taken.
+    fn take_result(&mut self) -> Option<Result<Imported, OpenError>> {
+        self.result()?;
+        self.reading.take()?.result.take()
     }
 
     /// The background reading's result, when it is for what is shown.
@@ -211,11 +262,18 @@ impl ImportDialog {
         let key = self.key();
         let reading = self.reading.as_mut()?;
         if reading.result.is_none() {
-            reading.result = reading.receiver.try_recv().ok();
+            reading.result = match reading.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                // The reading thread ended without an answer (it panicked).
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(OpenError::Workbook(WorkbookError::Crashed)))
+                }
+            };
             // A workbook's sheets and preview come with its reading.
             if let (Some(Ok(imported)), Some((sheets, _))) = (&reading.result, &mut self.workbook) {
                 *sheets = imported.sheets.clone();
-                let rows: Vec<Vec<String>> = imported
+                let rows: Vec<Vec<Cell>> = imported
                     .table
                     .rows()
                     .iter()
@@ -241,7 +299,8 @@ impl ImportDialog {
             return;
         }
         let now = ctx.input(|i| i.time);
-        if now - self.changed_at < SETTLE {
+        // Once Import is chosen, the options have settled.
+        if self.opening.is_none() && now - self.changed_at < SETTLE {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(SETTLE));
             return;
         }
@@ -250,15 +309,79 @@ impl ImportDialog {
         let path = self.path.clone();
         let ctx = ctx.clone();
         let job = key.clone();
+        let cancel = Cancel::default();
+        let stop = cancel.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(Self::read(&path, &bytes, &job));
-            ctx.request_repaint();
+            let started = std::time::Instant::now();
+            let Some(read) = Self::read(&path, &bytes, &job, &stop) else {
+                crate::diag::log(
+                    crate::diag::Level::Info,
+                    "stopped the reading for earlier options",
+                );
+                return;
+            };
+            crate::diag::record("import.read", started.elapsed());
+            if let Err(error) = &read {
+                // The error's kind only: a workbook's error can quote it.
+                let kind = match error {
+                    OpenError::TooLarge(_) => "too large",
+                    OpenError::Workbook(WorkbookError::Unreadable(_)) => "unreadable workbook",
+                    OpenError::Workbook(WorkbookError::TooLarge) => "workbook too large",
+                    OpenError::Workbook(WorkbookError::Crashed) => "the reading crashed",
+                    OpenError::Workbook(WorkbookError::TimedOut) => "the reading timed out",
+                };
+                crate::diag::log(crate::diag::Level::Warning, &format!("reading: {kind}"));
+            }
+            // Refused once the reading is no longer wanted: the table is
+            // then freed here.
+            if sender.send(read).is_ok() {
+                ctx.request_repaint();
+            }
         });
+        // The reading replaced, if any, stops.
         self.reading = Some(Reading {
             key,
             receiver,
             result: None,
+            cancel,
         });
+    }
+
+    /// The file's name, sheet names, preview, error and "Other" field may
+    /// need the system's fonts: checked when they change.
+    fn cover_fonts(&mut self, ctx: &egui::Context) {
+        if crate::theme::system_fonts_all_requested() {
+            return;
+        }
+        let checked = Some((self.key(), self.result().is_some(), self.other_text.clone()));
+        if self.fonts_checked == checked {
+            return;
+        }
+        self.fonts_checked = checked;
+        let mut shown = self.other_text.clone();
+        if let Some(Err(error)) = self.result() {
+            shown.push('\n');
+            shown.push_str(&open_error_text(error));
+        }
+        let name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        let sheets = self
+            .workbook
+            .as_ref()
+            .map(|(s, _)| s.clone())
+            .unwrap_or_default();
+        let preview = self.preview_rows();
+        let texts = preview
+            .rows
+            .iter()
+            .flatten()
+            .map(Cell::as_str)
+            .chain(sheets.iter().map(String::as_str))
+            .chain(name.as_deref())
+            .chain([shown.as_str()]);
+        crate::theme::cover(ctx, texts);
     }
 
     fn preview_rows(&mut self) -> &Preview {
@@ -270,8 +393,11 @@ impl ImportDialog {
                 invalid_bytes: 0,
             });
         }
-        self.preview
-            .get_or_insert_with(|| table::preview(&self.bytes, &self.options, PREVIEW_ROWS))
+        self.preview.get_or_insert_with(|| {
+            crate::diag::measure("import.preview", || {
+                table::preview(&self.bytes, &self.options, PREVIEW_ROWS)
+            })
+        })
     }
 
     /// Ticks or unticks a delimiter, keeping the order they were chosen in.
@@ -286,6 +412,7 @@ impl ImportDialog {
 
     pub fn show(&mut self, ctx: &egui::Context) -> Option<Outcome> {
         let mut outcome = None;
+        let mut open = false;
         // Read before the fields: a single-line field drops the keyboard
         // in the frame Enter is pressed.
         let typing = ctx.memory(|m| m.focused().is_some());
@@ -294,6 +421,7 @@ impl ImportDialog {
             ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         }
         self.keep_reading(ctx);
+        self.cover_fonts(ctx);
         let dark = ctx.global_style().visuals.dark_mode;
         let p = if dark { &theme::DARK } else { &theme::LIGHT };
         let frame = egui::Frame::new()
@@ -301,49 +429,92 @@ impl ImportDialog {
             .stroke(Stroke::new(1.0, p.line))
             .corner_radius(14)
             .shadow(ctx.global_style().visuals.window_shadow);
+        // As large as the window allows: the options scroll, the title
+        // and the buttons stay in view.
+        let room = theme::dialog_room(ctx, vec2(WIDTH, f32::INFINITY));
+        self.width = room.x;
         let modal = egui::Modal::new(egui::Id::new("import"))
             .backdrop_color(p.scrim)
             .frame(frame)
             .show(ctx, |ui| {
-                ui.set_width(WIDTH);
+                ui.set_width(self.width);
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
                 let before = self.key();
                 if self.title(ui) {
                     outcome = Some(Outcome::Cancel);
                 }
-                egui::Frame::new()
-                    .inner_margin(Margin::symmetric(SIDE as i8, 20))
+                let body = (room.y - ui.min_rect().height() - FOOTER).max(60.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("import-options")
+                    .max_height(body)
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 20.0;
-                        if self.workbook.is_some() {
-                            self.sheet_field(ui);
-                        } else {
-                            self.fields(ui);
-                            self.separators(ui);
-                        }
-                        self.switches(ui);
-                        self.preview(ui);
+                        egui::Frame::new()
+                            .inner_margin(Margin::symmetric(SIDE as i8, 20))
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 20.0;
+                                if self.workbook.is_some() {
+                                    self.sheet_field(ui);
+                                } else {
+                                    self.fields(ui);
+                                    self.separators(ui);
+                                }
+                                self.switches(ui);
+                                self.preview(ui);
+                            });
                     });
                 if self.key() != before {
                     self.preview = None;
+                    // Other options: Import must be chosen again.
+                    self.opening = None;
                     // A sheet is read at once; options, once they settle.
                     if self.workbook.is_none() {
                         self.changed_at = ui.input(|i| i.time);
                     }
                 }
-                if let Some(o) = self.footer(ui) {
-                    outcome = Some(o);
+                match self.footer(ui) {
+                    Some(Choice::Open) => open = true,
+                    Some(Choice::Cancel) => outcome = Some(Outcome::Cancel),
+                    None => {}
                 }
             });
-        if modal.should_close() && outcome.is_none() {
+        // Escape cancels, as the close button and Cancel do; a click beside
+        // the window doesn't (it would lose the options and the reading).
+        // Neither key is for it when another dialog is on top.
+        let keys = modal.is_top_modal && !modal.any_popup_open;
+        if keys
+            && outcome.is_none()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
             outcome = Some(Outcome::Cancel);
         }
-        if outcome.is_none() && !typing && ctx.input(|i| i.key_pressed(Key::Enter)) {
-            outcome = Some(Outcome::Open);
+        if keys
+            && outcome.is_none()
+            && !typing
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
+        {
+            open = true;
         }
-        // A file too large to open can't be imported.
-        if matches!(outcome, Some(Outcome::Open)) && matches!(self.result(), Some(Err(_))) {
-            outcome = None;
+        // Opens once the reading is done, started now if need be; a file
+        // too large to open can't be imported.
+        if open
+            && outcome.is_none()
+            && self.opening.is_none()
+            && !matches!(self.result(), Some(Err(_)))
+        {
+            self.opening = Some(std::time::Instant::now());
+            self.keep_reading(ctx);
+        }
+        if outcome.is_none() && self.opening.is_some() {
+            match self.result() {
+                Some(Ok(_)) => {
+                    outcome = self
+                        .take_result()
+                        .and_then(Result::ok)
+                        .map(|imported| Outcome::Open(Box::new(imported)))
+                }
+                Some(Err(_)) => self.opening = None,
+                None => {}
+            }
         }
         outcome
     }
@@ -371,10 +542,11 @@ impl ImportDialog {
             Some(Err(error)) => open_error_text(error),
             None => t!("import-reading"),
         };
+        let reading = self.result().is_none();
         if header && let Some(line) = first_line {
             summary.push_str(&format!(
                 " \u{b7} {}",
-                t!("import-header-line", line = line)
+                t!("import-header-line", line = line.to_string())
             ));
         }
         let mut close = false;
@@ -386,7 +558,7 @@ impl ImportDialog {
                 bottom: 18,
             })
             .show(ui, |ui| {
-                ui.set_width(WIDTH - SIDE - 16.0);
+                ui.set_width(self.width - SIDE - 16.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 14.0;
                     let (rect, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
@@ -406,7 +578,13 @@ impl ImportDialog {
                                 .font(theme::semibold(17.0))
                                 .color(p.text),
                         );
-                        ui.label(egui::RichText::new(summary).size(13.0).color(p.muted));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if reading {
+                                ui.add(egui::Spinner::new().size(12.0).color(p.muted));
+                            }
+                            ui.label(egui::RichText::new(summary).size(13.0).color(p.muted));
+                        });
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let label = t!("cancel");
@@ -428,7 +606,7 @@ impl ImportDialog {
     /// Character set, starting line and quote character.
     fn fields(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
-        let width = (WIDTH - 2.0 * SIDE - 32.0) / 3.0;
+        let width = (self.width - 2.0 * SIDE - 32.0) / 3.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
             field(ui, width, &t!("import-encoding"), |ui| {
@@ -515,7 +693,7 @@ impl ImportDialog {
 
     /// A workbook's sheet to open.
     fn sheet_field(&mut self, ui: &mut egui::Ui) {
-        let width = (WIDTH - 2.0 * SIDE - 32.0) / 3.0;
+        let width = (self.width - 2.0 * SIDE - 32.0) / 3.0;
         let Some((sheets, sheet)) = &mut self.workbook else {
             return;
         };
@@ -610,7 +788,7 @@ impl ImportDialog {
     /// Header row, merged delimiters and trimmed spaces: cards with a
     /// switch.
     fn switches(&mut self, ui: &mut egui::Ui) {
-        let width = (WIDTH - 2.0 * SIDE - 16.0) / 3.0;
+        let width = (self.width - 2.0 * SIDE - 16.0) / 3.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let header = self.header;
@@ -655,55 +833,49 @@ impl ImportDialog {
             Some(Ok(imported)) => Some(imported.table.col_count()),
             _ => None,
         };
+        let cols = (self.preview_rows().rows.iter().map(Vec::len).max())
+            .unwrap_or(1)
+            .max(total.unwrap_or(0));
+        let inner = self.width - 2.0 * SIDE;
+        // The columns in view: those scrolled to last frame, else the
+        // first ones.
+        let fitting = (((inner - 2.0 - PREVIEW_NUMBER) / PREVIEW_COL).floor() as usize).max(1);
+        let in_view = self.preview_cols.clone().unwrap_or(0..fitting);
+        let note = columns_note(no_delimiter, in_view, cols);
         let preview = self.preview_rows();
         let rows = &preview.rows;
         let lines = &preview.lines;
-        let cols = rows
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(1)
-            .max(total.unwrap_or(0));
-        let inner = WIDTH - 2.0 * SIDE;
-        let fitting = ((inner - 2.0 - PREVIEW_NUMBER) / PREVIEW_COL).floor() as usize;
-        let note = if no_delimiter {
-            t!("import-no-separator")
-        } else if cols > fitting {
-            t!(
-                "import-columns-shown",
-                first = columns::label(0),
-                last = columns::label(fitting - 1),
-                count = cols
-            )
-        } else {
-            String::new()
-        };
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 8.0;
-            ui.horizontal(|ui| {
-                ui.set_width(inner);
-                section_label(ui, &t!("import-preview"));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(egui::RichText::new(note).size(12.0).color(p.faint));
+        let in_view = ui
+            .vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.horizontal(|ui| {
+                    ui.set_width(inner);
+                    section_label(ui, &t!("import-preview"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(egui::RichText::new(note).size(12.0).color(p.faint));
+                    });
                 });
-            });
-            egui::Frame::new()
-                .fill(p.bg)
-                .stroke(Stroke::new(1.0, p.line))
-                .corner_radius(10)
-                .show(ui, |ui| {
-                    ui.set_width(inner - 2.0);
-                    let height = PREVIEW_ROW * (PREVIEW_VISIBLE + 1.0);
-                    egui::ScrollArea::both()
-                        .max_height(height)
-                        .min_scrolled_height(height)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| preview_table(ui, rows, lines, cols, header, p));
-                });
-        });
+                egui::Frame::new()
+                    .fill(p.bg)
+                    .stroke(Stroke::new(1.0, p.line))
+                    .corner_radius(10)
+                    .show(ui, |ui| {
+                        ui.set_width(inner - 2.0);
+                        let height = PREVIEW_ROW * (PREVIEW_VISIBLE + 1.0);
+                        egui::ScrollArea::both()
+                            .max_height(height)
+                            .min_scrolled_height(height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| preview_table(ui, rows, lines, cols, header, p))
+                            .inner
+                    })
+                    .inner
+            })
+            .inner;
+        self.preview_cols = Some(in_view);
     }
 
-    fn footer(&mut self, ui: &mut egui::Ui) -> Option<Outcome> {
+    fn footer(&mut self, ui: &mut egui::Ui) -> Option<Choice> {
         let p = palette(ui);
         let mut outcome = None;
         let response = egui::Frame::new()
@@ -720,7 +892,7 @@ impl ImportDialog {
                 bottom: 14,
             })
             .show(ui, |ui| {
-                ui.set_width(WIDTH - SIDE - 16.0);
+                ui.set_width(self.width - SIDE - 16.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     // Bytes the encoding can't read come first: they would be
@@ -730,6 +902,7 @@ impl ImportDialog {
                         _ => self.preview_rows().invalid_bytes,
                     };
                     let too_large = matches!(self.result(), Some(Err(_)));
+                    let opening = self.opening.is_some();
                     if invalid > 0 {
                         ui.label(
                             egui::RichText::new(icon::WARNING)
@@ -750,17 +923,21 @@ impl ImportDialog {
                         ui.label(egui::RichText::new(detected).size(12.0).color(p.muted));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let import = format!("{}  \u{21b5}", t!("import-open"));
+                        let import = if opening {
+                            t!("import-opening")
+                        } else {
+                            format!("{}  \u{21b5}", t!("import-open"))
+                        };
                         let open = ui
-                            .add_enabled_ui(!too_large, |ui| {
+                            .add_enabled_ui(!too_large && !opening, |ui| {
                                 theme::primary_button(ui, &import, 0.0)
                             })
                             .inner;
                         if open.clicked() {
-                            outcome = Some(Outcome::Open);
+                            outcome = Some(Choice::Open);
                         }
                         if theme::secondary_button(ui, &t!("cancel"), 0.0).clicked() {
-                            outcome = Some(Outcome::Cancel);
+                            outcome = Some(Choice::Cancel);
                         }
                     });
                 });
@@ -970,12 +1147,12 @@ fn switch_card(ui: &mut egui::Ui, width: f32, on: bool, label: &str, hint: &str)
 /// what is scrolled into view is drawn.
 fn preview_table(
     ui: &mut egui::Ui,
-    rows: &[Vec<String>],
+    rows: &[Vec<Cell>],
     lines: &[usize],
     cols: usize,
     header: bool,
     p: &Palette,
-) {
+) -> std::ops::Range<usize> {
     let size = vec2(
         PREVIEW_NUMBER + cols as f32 * PREVIEW_COL,
         PREVIEW_ROW * (rows.len() as f32 + 1.0),
@@ -990,6 +1167,13 @@ fn preview_table(
         let from = ((clip.left() - col_x(0)) / PREVIEW_COL).floor().max(0.0) as usize;
         let to = ((clip.right() - col_x(0)) / PREVIEW_COL).ceil().max(0.0) as usize;
         from.min(cols)..to.min(cols)
+    };
+    // For the note: the columns mostly in view.
+    let in_view = {
+        let from = ((clip.left() - col_x(0)) / PREVIEW_COL).round().max(0.0) as usize;
+        let to = ((clip.right() - col_x(0)) / PREVIEW_COL).round().max(0.0) as usize;
+        let from = from.min(cols.saturating_sub(1));
+        from..to.clamp(from + 1, cols.max(from + 1))
     };
 
     for (r, row) in rows.iter().enumerate() {
@@ -1029,7 +1213,7 @@ fn preview_table(
                 theme::regular(12.0)
             };
             let color = if c == 0 && !head { p.muted } else { p.text };
-            theme::truncated_text(ui, cell_rect, &flat_text(cell), font, color, Align::Min);
+            theme::truncated_text(ui, cell_rect, flat_text(cell), font, color, Align::Min);
         }
     }
     for c in visible_cols.clone() {
@@ -1064,6 +1248,26 @@ fn preview_table(
         pos2(rect.left() + PREVIEW_NUMBER, rect.bottom()),
         p.line,
     );
+    in_view
+}
+
+/// The note above the preview: no separator, or which of the `cols`
+/// columns are in view when not all of them are.
+fn columns_note(no_delimiter: bool, in_view: std::ops::Range<usize>, cols: usize) -> String {
+    let last = in_view.end.min(cols);
+    let first = in_view.start.min(last.saturating_sub(1));
+    if no_delimiter {
+        t!("import-no-separator")
+    } else if first > 0 || last < cols {
+        t!(
+            "import-columns-shown",
+            first = columns::label(first),
+            last = columns::label(last - 1),
+            count = cols
+        )
+    } else {
+        String::new()
+    }
 }
 
 /// Why a file can't be opened, for the user.
@@ -1079,5 +1283,31 @@ pub fn open_error_text(error: &OpenError) -> String {
             t!("import-workbook-unreadable", error = why.clone())
         }
         OpenError::Workbook(WorkbookError::Crashed) => t!("import-workbook-crashed"),
+        OpenError::Workbook(WorkbookError::TimedOut) => t!(
+            "import-workbook-timed-out",
+            minutes = workbook::READ_TIMEOUT.as_secs() / 60
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_note_names_the_columns_in_view() {
+        assert_eq!(columns_note(false, 0..4, 3), "");
+        assert_eq!(columns_note(false, 0..4, 4), "");
+        let note = columns_note(false, 0..4, 312);
+        assert!(
+            note.contains('A') && note.contains('D') && note.contains("312"),
+            "{note}"
+        );
+        let note = columns_note(false, 286..290, 312);
+        assert!(note.contains("KA") && note.contains("KD"), "{note}");
+        // Scrolled to the end: the last columns.
+        let note = columns_note(false, 310..314, 312);
+        assert!(note.contains("KY") && note.contains("KZ"), "{note}");
+        assert_eq!(columns_note(true, 0..4, 312), t!("import-no-separator"));
     }
 }
