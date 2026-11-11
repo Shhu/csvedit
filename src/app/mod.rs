@@ -6,14 +6,14 @@ mod grid;
 mod inspector;
 mod titlebar;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 
 use crate::columns;
 use crate::i18n::t;
-use crate::import::{ImportDialog, Outcome};
+use crate::import::{ImportDialog, Outcome, open_error_text};
 use crate::table::{self, Edit, Encoding, Format, LineEnding, Losses, Table, Unencodable};
 use crate::theme;
 
@@ -143,6 +143,14 @@ pub struct CsvApp {
     /// "Save over the original?" is asked, then this waits.
     confirm_overwrite: Option<Option<Pending>>,
     file_request: Option<FileRequest>,
+    /// The workbook the table was read from: it is saved as a CSV file
+    /// beside it, never over it.
+    origin: Option<PathBuf>,
+    /// A workbook's formulas, by (row, column), shown in the inspector.
+    formulas: HashMap<(usize, usize), String>,
+    /// Cells that a spreadsheet would take for a formula are written with
+    /// an apostrophe first (CSV injection).
+    protect_formulas: bool,
     /// Commands chosen in menus, run once the frame's grid is drawn.
     deferred: Vec<Command>,
     /// The grid handled a key this frame: the keyboard stays with it.
@@ -212,6 +220,9 @@ impl CsvApp {
             overwrite_accepted: false,
             confirm_overwrite: None,
             file_request: None,
+            origin: None,
+            formulas: HashMap::new(),
+            protect_formulas: protect_formulas_saved(),
             deferred: Vec::new(),
             grid_keys: false,
             generation: 0,
@@ -293,6 +304,10 @@ impl CsvApp {
     }
 
     fn load(&mut self, path: &Path) {
+        if crate::workbook::is_workbook(path) {
+            self.import = Some(ImportDialog::workbook(path.to_owned(), self.header));
+            return;
+        }
         match std::fs::read(path) {
             Ok(bytes) => {
                 self.import = Some(ImportDialog::new(path.to_owned(), bytes, self.header));
@@ -333,16 +348,22 @@ impl CsvApp {
         let directory = self
             .path
             .as_deref()
+            .or(self.origin.as_deref())
             .and_then(Path::parent)
             .filter(|dir| !dir.as_os_str().is_empty());
-        let mut dialog = rfd::FileDialog::new()
-            .set_parent(frame)
-            .add_filter(t!("filter-csv"), &["csv", "tsv", "txt"]);
+        let mut dialog = rfd::FileDialog::new().set_parent(frame);
         if let Some(dir) = directory {
             dialog = dialog.set_directory(dir);
         }
         match request {
             FileRequest::Open => {
+                let text = ["csv", "tsv", "txt"];
+                let books = crate::workbook::EXTENSIONS;
+                let both: Vec<&str> = text.iter().chain(&books).copied().collect();
+                dialog = dialog
+                    .add_filter(t!("filter-supported"), &both)
+                    .add_filter(t!("filter-csv"), &text)
+                    .add_filter(t!("filter-workbooks"), &books);
                 // GTK turns "*" into "*.*", which hides files without an
                 // extension: without filter, it shows everything.
                 if cfg!(windows) {
@@ -354,10 +375,16 @@ impl CsvApp {
             }
             FileRequest::SaveAs(then) => {
                 self.commit_editing();
-                let name = self
-                    .path
-                    .as_deref()
-                    .map_or_else(|| t!("untitled-file"), file_name);
+                // A workbook's table goes to "name.csv", beside it.
+                let name = match (&self.path, &self.origin) {
+                    (Some(path), _) => file_name(path),
+                    (None, Some(origin)) => origin
+                        .with_extension("csv")
+                        .file_name()
+                        .map_or_else(|| t!("untitled-file"), |n| n.to_string_lossy().into_owned()),
+                    (None, None) => t!("untitled-file"),
+                };
+                dialog = dialog.add_filter(t!("filter-csv"), &["csv", "tsv", "txt"]);
                 if let Some(path) = dialog.set_file_name(name).save_file()
                     && self.save_to(&path)
                 {
@@ -372,7 +399,9 @@ impl CsvApp {
     }
 
     fn save_to(&mut self, path: &Path) -> bool {
-        let result = match table::write(&self.table, &self.format) {
+        let mut format = self.format.clone();
+        format.protect_formulas = self.protect_formulas;
+        let result = match table::write(&self.table, &format) {
             Ok(bytes) => write_safely(path, &bytes).map_err(|e| e.to_string()),
             Err(Unencodable { character, cell }) => {
                 if let Some((row, col)) = cell {
@@ -407,6 +436,7 @@ impl CsvApp {
 
     fn commit(&mut self, edit: Edit) {
         self.remap_shown(&edit);
+        self.remap_formulas(&edit);
         let inverse = self.table.apply(edit);
         if self
             .saved_depth
@@ -423,6 +453,7 @@ impl CsvApp {
         self.commit_editing();
         if let Some(edit) = self.undo.pop() {
             self.remap_shown(&edit);
+            self.remap_formulas(&edit);
             self.redo.push(self.table.apply(edit));
             self.after_change();
         }
@@ -432,6 +463,7 @@ impl CsvApp {
         self.commit_editing();
         if let Some(edit) = self.redo.pop() {
             self.remap_shown(&edit);
+            self.remap_formulas(&edit);
             self.undo.push(self.table.apply(edit));
             self.after_change();
         }
@@ -514,6 +546,84 @@ impl CsvApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Keeps a workbook's formulas on their cells through `edit`, about to
+    /// be applied; a cell given a new value loses its formula.
+    fn remap_formulas(&mut self, edit: &Edit) {
+        if self.formulas.is_empty() {
+            return;
+        }
+        let moved = |f: &dyn Fn(usize, usize) -> Option<(usize, usize)>,
+                     map: &mut HashMap<_, _>| {
+            *map = std::mem::take(map)
+                .into_iter()
+                .filter_map(|((r, c), text)| f(r, c).map(|at| (at, text)))
+                .collect();
+        };
+        match edit {
+            Edit::Batch(edits) => {
+                for edit in edits {
+                    self.remap_formulas(edit);
+                }
+            }
+            Edit::SetCells(cells) => {
+                for (r, c, _) in cells {
+                    self.formulas.remove(&(*r, *c));
+                }
+            }
+            Edit::InsertRows(at, rows) => {
+                let (at, n) = (*at, rows.len());
+                moved(
+                    &|r, c| Some((if r >= at { r + n } else { r }, c)),
+                    &mut self.formulas,
+                );
+            }
+            Edit::RemoveRows(at, n) => {
+                let (at, n) = (*at, *n);
+                moved(
+                    &|r, c| match r {
+                        r if r < at => Some((r, c)),
+                        r if r < at + n => None,
+                        r => Some((r - n, c)),
+                    },
+                    &mut self.formulas,
+                );
+            }
+            Edit::InsertCols(at, cols) => {
+                let (at, n) = (*at, cols.len());
+                moved(
+                    &|r, c| Some((r, if c >= at { c + n } else { c })),
+                    &mut self.formulas,
+                );
+            }
+            Edit::RemoveCols(at, n) => {
+                let (at, n) = (*at, *n);
+                moved(
+                    &|r, c| match c {
+                        c if c < at => Some((r, c)),
+                        c if c < at + n => None,
+                        c => Some((r, c - n)),
+                    },
+                    &mut self.formulas,
+                );
+            }
+            Edit::Reorder(start, order) => {
+                // Row start + i takes old row start + order[i].
+                let mut new_place = vec![0; order.len()];
+                for (i, &from) in order.iter().enumerate() {
+                    new_place[from] = i;
+                }
+                let start = *start;
+                moved(
+                    &|r, c| match r.checked_sub(start) {
+                        Some(i) if i < new_place.len() => Some((start + new_place[i], c)),
+                        _ => Some((r, c)),
+                    },
+                    &mut self.formulas,
+                );
+            }
         }
     }
 
@@ -909,21 +1019,29 @@ impl CsvApp {
                     let dialog = self.import.take().expect("an import dialog");
                     let header = dialog.header;
                     let path = dialog.path.clone();
+                    let book = dialog.is_workbook();
                     match dialog.into_imported() {
                         Ok(imported) => {
-                            self.reset(imported.table, imported.format, Some(path));
+                            // A workbook is never saved over: Save asks for
+                            // a CSV file.
+                            let saved_to = (!book).then(|| path.clone());
+                            self.reset(imported.table, imported.format, saved_to);
                             self.losses = imported.losses;
                             self.header = header;
+                            if book {
+                                self.origin = Some(path);
+                                self.formulas = imported
+                                    .formulas
+                                    .into_iter()
+                                    .map(|(r, c, f)| ((r, c), f))
+                                    .collect();
+                            }
                         }
-                        Err(too_large) => {
+                        Err(error) => {
                             self.error = Some(t!(
                                 "error-open",
                                 file = file_name(&path),
-                                error = t!(
-                                    "import-too-large",
-                                    rows = too_large.rows,
-                                    cols = too_large.cols
-                                )
+                                error = open_error_text(&error)
                             ));
                         }
                     }
@@ -1080,6 +1198,7 @@ impl CsvApp {
     fn display_name(&self) -> String {
         self.path
             .as_deref()
+            .or(self.origin.as_deref())
             .map_or_else(|| t!("untitled"), file_name)
     }
 
@@ -1283,6 +1402,19 @@ pub fn capped(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The "protect formulas" choice made last time (off at first: files are
+/// written as they are).
+fn protect_formulas_saved() -> bool {
+    std::fs::read_to_string(crate::config::dir().join("protect-formulas"))
+        .is_ok_and(|s| s.trim() == "on")
+}
+
+fn save_protect_formulas(on: bool) {
+    let dir = crate::config::dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("protect-formulas"), if on { "on" } else { "off" });
+}
+
 /// Writes `bytes` to a new file beside `path`, then puts it in its place:
 /// a failure halfway leaves the old file whole.
 fn write_safely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1367,6 +1499,25 @@ mod tests {
     use crate::i18n::{self, Lang};
 
     #[test]
+    fn formulas_follow_their_cells() {
+        let mut app = CsvApp::new(None);
+        app.reset(Table::empty(3, 2), Format::default(), None);
+        app.formulas.insert((2, 1), "SUM(B1:B2)".into());
+        app.selected = (0, 0);
+        app.run(Command::InsertRowAbove);
+        app.run(Command::InsertColLeft);
+        assert_eq!(
+            app.formulas.get(&(3, 2)).map(String::as_str),
+            Some("SUM(B1:B2)")
+        );
+        app.undo();
+        app.undo();
+        assert!(app.formulas.contains_key(&(2, 1)));
+        app.commit(Edit::SetCells(vec![(2, 1, "7".into())]));
+        assert!(app.formulas.is_empty());
+    }
+
+    #[test]
     fn line_breaks_and_br_tags() {
         assert_eq!(
             split_breaks("a<BR><br />b\r\nc"),
@@ -1449,7 +1600,7 @@ AN-1052;House;Tresses;33370;5;128;468000;Contemporary house, pool, three bedroom
     /// text is found; `CSVEDIT_COLUMNS` lists the columns shown,
     /// `CSVEDIT_LABELS` names them (`one`, `zero`), `CSVEDIT_CHOOSER` opens
     /// the column chooser; with `CSVEDIT_IMPORT`, the import window is open
-    /// (`poliris`: on a Poliris file); `CSVEDIT_DEMO` shows the website's
+    /// (`poliris`: on a Poliris file, `xlsx`: on a workbook); `CSVEDIT_DEMO` shows the website's
     /// made-up listing of homes.
     #[test]
     #[ignore = "needs a graphics renderer"]
@@ -1495,7 +1646,11 @@ AN-1052;House;Tresses;33370;5;128;468000;Contemporary house, pool, three bedroom
                 if let Ok(find) = std::env::var("CSVEDIT_FIND") {
                     app.find = find;
                 }
-                if let Ok(kind) = std::env::var("CSVEDIT_IMPORT") {
+                if std::env::var("CSVEDIT_IMPORT").as_deref() == Ok("xlsx") {
+                    let path = std::env::temp_dir().join("csvedit-capture.xlsx");
+                    std::fs::write(&path, crate::workbook::tests::sample()).expect("sample");
+                    app.import = Some(ImportDialog::workbook(path, true));
+                } else if let Ok(kind) = std::env::var("CSVEDIT_IMPORT") {
                     let bytes = if kind == "poliris" {
                         DEMO_POLIRIS.as_bytes().to_vec()
                     } else {
@@ -1509,7 +1664,11 @@ AN-1052;House;Tresses;33370;5;128;468000;Contemporary house, pool, three bedroom
                 }
                 app
             });
-        harness.run_steps(4);
+        // Background readings get the time to finish.
+        for _ in 0..20 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let image = harness.render().expect("render");
         image.save(&out).expect("writing the capture");
     }

@@ -8,12 +8,18 @@ mod i18n;
 mod import;
 mod table;
 mod theme;
+mod workbook;
 
 use std::path::PathBuf;
 
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // Started again by itself to read a workbook, apart (src/workbook.rs).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == workbook::READER_ARG) {
+        std::process::exit(workbook::reader_main(&args[2..]));
+    }
     i18n::init();
     columns::init();
     // Absolute: dialogs open in its folder, and saving doesn't depend on

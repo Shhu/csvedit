@@ -28,6 +28,8 @@
       <li xml:lang="fr">Modification des cellules, insertion et suppression de lignes et de colonnes, tri, recherche, annulation</li>
       <li>Copy and paste with spreadsheets</li>
       <li xml:lang="fr">Copier-coller avec les tableurs</li>
+      <li>Reads Excel and LibreOffice workbooks (.xlsx, .xls, .xlsb, .ods), values only, without ever running macros, and saves them as CSV</li>
+      <li xml:lang="fr">Lit les classeurs Excel et LibreOffice (.xlsx, .xls, .xlsb, .ods), valeurs seules, sans jamais exécuter de macros, et les enregistre en CSV</li>
     </ul>
   </description>
   <launchable type="desktop-id">io.github.Shhu.CsvEdit.desktop</launchable>
@@ -44,6 +46,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.2.0" date="2026-11-11">
+      <description>
+        <p>Opens Excel and LibreOffice workbooks (.xlsx, .xlsm, .xlsb, .xls, .ods): pick the sheet, values only (formulas give their saved result, shown in the inspector), never macros; read apart from the app, so that a damaged or crafted file can't take it down. A new option protects cells that would run as formulas when the CSV file is opened in a spreadsheet.</p>
+      </description>
+    </release>
     <release version="0.1.2" date="2026-11-08">
       <description>
         <p>Sorting puts dates and times in time order (01/07/2026 17:32:30, 2026-07-01, 5:32 PM…), after numbers and before text.</p>

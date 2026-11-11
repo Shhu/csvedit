@@ -7,5 +7,5 @@ Exec=csvedit %f
 Icon=io.github.Shhu.CsvEdit
 Terminal=false
 Categories=Office;Spreadsheet;
-MimeType=text/csv;text/tab-separated-values;
-Keywords=csv;tsv;table;spreadsheet;editor;
+MimeType=text/csv;text/tab-separated-values;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.ms-excel;application/vnd.ms-excel.sheet.macroEnabled.12;application/vnd.ms-excel.sheet.binary.macroEnabled.12;application/vnd.oasis.opendocument.spreadsheet;
+Keywords=csv;tsv;xlsx;xls;ods;excel;table;spreadsheet;editor;

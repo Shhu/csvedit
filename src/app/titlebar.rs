@@ -135,6 +135,13 @@ impl CsvApp {
             Command::SaveAs,
         );
         ui.separator();
+        let protect = ui
+            .checkbox(&mut self.protect_formulas, t!("protect-formulas"))
+            .on_hover_text(t!("protect-formulas-hint"));
+        if protect.changed() {
+            save_protect_formulas(self.protect_formulas);
+        }
+        ui.separator();
         self.menu_item(ui, t!("command-quit"), Some(SHORTCUT_QUIT), Command::Quit);
     }
 

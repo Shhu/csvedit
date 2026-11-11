@@ -13,8 +13,9 @@ use egui_phosphor::regular as icon;
 use crate::app::{delimiter_glyph, delimiter_name, encoding_name, flat_text, line_ending_name};
 use crate::columns;
 use crate::i18n::t;
-use crate::table::{self, Encoding, ImportOptions, Imported, Preview, TooLarge};
+use crate::table::{self, Encoding, Format, ImportOptions, Imported, Preview, Table, TooLarge};
 use crate::theme::{self, Palette, palette};
+use crate::workbook::{self, WorkbookError};
 
 /// Width of the window.
 const WIDTH: f32 = 820.0;
@@ -54,13 +55,29 @@ pub struct ImportDialog {
     changed_at: f64,
     /// The "Other" field had the keyboard at the end of the last frame.
     other_focused: bool,
+    /// A workbook: the sheets found so far, and the one chosen.
+    workbook: Option<(Vec<String>, usize)>,
+}
+
+/// Why a file can't be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenError {
+    TooLarge(TooLarge),
+    Workbook(WorkbookError),
+}
+
+/// What is read: a text file with some options, or a workbook's sheet.
+#[derive(Clone, Debug, PartialEq)]
+enum ReadKey {
+    Text(ImportOptions),
+    Sheet(usize),
 }
 
 /// The whole file being read in the background.
 struct Reading {
-    options: ImportOptions,
-    receiver: mpsc::Receiver<Result<Imported, TooLarge>>,
-    result: Option<Result<Imported, TooLarge>>,
+    key: ReadKey,
+    receiver: mpsc::Receiver<Result<Imported, OpenError>>,
+    result: Option<Result<Imported, OpenError>>,
 }
 
 impl ImportDialog {
@@ -112,45 +129,115 @@ impl ImportDialog {
             reading: None,
             changed_at: f64::NEG_INFINITY,
             other_focused: false,
+            workbook: None,
+        }
+    }
+
+    /// For a workbook (.xlsx, .xls, .ods…): its sheets are read in the
+    /// background, apart (see `workbook`).
+    pub fn workbook(path: PathBuf, header: bool) -> Self {
+        Self {
+            detected: Some(t!("import-workbook")),
+            workbook: Some((Vec::new(), 0)),
+            ..Self::new(path, Vec::new(), header)
+        }
+    }
+
+    pub fn is_workbook(&self) -> bool {
+        self.workbook.is_some()
+    }
+
+    fn key(&self) -> ReadKey {
+        match self.workbook {
+            Some((_, sheet)) => ReadKey::Sheet(sheet),
+            None => ReadKey::Text(self.options.clone()),
+        }
+    }
+
+    /// Reads now what `key` says.
+    fn read(path: &std::path::Path, bytes: &[u8], key: &ReadKey) -> Result<Imported, OpenError> {
+        match key {
+            ReadKey::Text(options) => table::import(bytes, options).map_err(OpenError::TooLarge),
+            ReadKey::Sheet(sheet) => {
+                let book = workbook::read(path, *sheet).map_err(OpenError::Workbook)?;
+                let table = if book.rows.is_empty() {
+                    Table::default()
+                } else {
+                    Table::from_rows(book.rows)
+                };
+                // Saved as a CSV Excel reads well: with a BOM, and the
+                // delimiter of the language's Excel.
+                let format = Format {
+                    delimiter: if crate::i18n::lang() == crate::i18n::Lang::Fr {
+                        ";".to_owned()
+                    } else {
+                        ",".to_owned()
+                    },
+                    encoding: Encoding::Utf8Bom,
+                    ..Format::default()
+                };
+                Ok(Imported {
+                    table,
+                    format,
+                    losses: table::Losses::default(),
+                    formulas: book.formulas,
+                    sheets: book.sheets,
+                })
+            }
         }
     }
 
     /// The file read with the chosen options: the background reading if it
     /// is done or under way with them, else read now.
-    pub fn into_imported(mut self) -> Result<Imported, TooLarge> {
+    pub fn into_imported(mut self) -> Result<Imported, OpenError> {
+        let key = self.key();
         match self.reading.take() {
             Some(Reading {
-                options,
+                key: k,
                 result: Some(result),
                 ..
-            }) if options == self.options => result,
+            }) if k == key => result,
             Some(Reading {
-                options, receiver, ..
-            }) if options == self.options => receiver
+                key: k, receiver, ..
+            }) if k == key => receiver
                 .recv()
-                .unwrap_or_else(|_| table::import(&self.bytes, &self.options)),
-            _ => table::import(&self.bytes, &self.options),
+                .unwrap_or_else(|_| Self::read(&self.path, &self.bytes, &key)),
+            _ => Self::read(&self.path, &self.bytes, &key),
         }
     }
 
-    /// The background reading's result, when it is for the options shown.
-    fn result(&mut self) -> Option<&Result<Imported, TooLarge>> {
+    /// The background reading's result, when it is for what is shown.
+    fn result(&mut self) -> Option<&Result<Imported, OpenError>> {
+        let key = self.key();
         let reading = self.reading.as_mut()?;
         if reading.result.is_none() {
             reading.result = reading.receiver.try_recv().ok();
+            // A workbook's sheets and preview come with its reading.
+            if let (Some(Ok(imported)), Some((sheets, _))) = (&reading.result, &mut self.workbook) {
+                *sheets = imported.sheets.clone();
+                let rows: Vec<Vec<String>> = imported
+                    .table
+                    .rows()
+                    .iter()
+                    .take(PREVIEW_ROWS)
+                    .cloned()
+                    .collect();
+                self.preview = Some(Preview {
+                    lines: (1..=rows.len()).collect(),
+                    rows,
+                    invalid_bytes: 0,
+                });
+            }
         }
-        (reading.options == self.options)
+        (reading.key == key)
             .then_some(reading.result.as_ref())
             .flatten()
     }
 
     /// Reads the whole file again once the options have settled.
     fn keep_reading(&mut self, ctx: &egui::Context) {
-        let current = self
-            .reading
-            .as_ref()
-            .is_some_and(|r| r.options == self.options);
-        if current {
+        let key = self.key();
+        if self.reading.as_ref().is_some_and(|r| r.key == key) {
             return;
         }
         let now = ctx.input(|i| i.time);
@@ -160,20 +247,29 @@ impl ImportDialog {
         }
         let (sender, receiver) = mpsc::channel();
         let bytes = Arc::clone(&self.bytes);
-        let options = self.options.clone();
+        let path = self.path.clone();
         let ctx = ctx.clone();
+        let job = key.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(table::import(&bytes, &options));
+            let _ = sender.send(Self::read(&path, &bytes, &job));
             ctx.request_repaint();
         });
         self.reading = Some(Reading {
-            options: self.options.clone(),
+            key,
             receiver,
             result: None,
         });
     }
 
     fn preview_rows(&mut self) -> &Preview {
+        if self.workbook.is_some() {
+            // Filled in when the sheet has been read.
+            return self.preview.get_or_insert_with(|| Preview {
+                rows: Vec::new(),
+                lines: Vec::new(),
+                invalid_bytes: 0,
+            });
+        }
         self.preview
             .get_or_insert_with(|| table::preview(&self.bytes, &self.options, PREVIEW_ROWS))
     }
@@ -211,7 +307,7 @@ impl ImportDialog {
             .show(ctx, |ui| {
                 ui.set_width(WIDTH);
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                let before = self.options.clone();
+                let before = self.key();
                 if self.title(ui) {
                     outcome = Some(Outcome::Cancel);
                 }
@@ -219,14 +315,21 @@ impl ImportDialog {
                     .inner_margin(Margin::symmetric(SIDE as i8, 20))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 20.0;
-                        self.fields(ui);
-                        self.separators(ui);
+                        if self.workbook.is_some() {
+                            self.sheet_field(ui);
+                        } else {
+                            self.fields(ui);
+                            self.separators(ui);
+                        }
                         self.switches(ui);
                         self.preview(ui);
                     });
-                if self.options != before {
+                if self.key() != before {
                     self.preview = None;
-                    self.changed_at = ui.input(|i| i.time);
+                    // A sheet is read at once; options, once they settle.
+                    if self.workbook.is_none() {
+                        self.changed_at = ui.input(|i| i.time);
+                    }
                 }
                 if let Some(o) = self.footer(ui) {
                     outcome = Some(o);
@@ -265,11 +368,7 @@ impl ImportDialog {
                     t!("import-columns", count = imported.table.col_count())
                 )
             }
-            Some(Err(too_large)) => t!(
-                "import-too-large",
-                rows = too_large.rows,
-                cols = too_large.cols
-            ),
+            Some(Err(error)) => open_error_text(error),
             None => t!("import-reading"),
         };
         if header && let Some(line) = first_line {
@@ -414,6 +513,25 @@ impl ImportDialog {
         });
     }
 
+    /// A workbook's sheet to open.
+    fn sheet_field(&mut self, ui: &mut egui::Ui) {
+        let width = (WIDTH - 2.0 * SIDE - 32.0) / 3.0;
+        let Some((sheets, sheet)) = &mut self.workbook else {
+            return;
+        };
+        let name = sheets
+            .get(*sheet)
+            .cloned()
+            .unwrap_or_else(|| "\u{2026}".to_owned());
+        field(ui, width * 2.0 + 16.0, &t!("import-sheet"), |ui| {
+            dropdown(ui, width * 2.0 + 16.0, &name, None, |ui| {
+                for (i, name) in sheets.iter().enumerate() {
+                    ui.selectable_value(sheet, i, name);
+                }
+            });
+        });
+    }
+
     /// The delimiters, as chips that toggle, and one of one's own.
     fn separators(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
@@ -508,6 +626,9 @@ impl ImportDialog {
                 self.header = !header;
             }
             let merge = self.options.merge_delimiters;
+            if self.workbook.is_some() {
+                return;
+            }
             if switch_card(
                 ui,
                 width,
@@ -943,4 +1064,20 @@ fn preview_table(
         pos2(rect.left() + PREVIEW_NUMBER, rect.bottom()),
         p.line,
     );
+}
+
+/// Why a file can't be opened, for the user.
+pub fn open_error_text(error: &OpenError) -> String {
+    match error {
+        OpenError::TooLarge(too_large) => t!(
+            "import-too-large",
+            rows = too_large.rows,
+            cols = too_large.cols
+        ),
+        OpenError::Workbook(WorkbookError::TooLarge) => t!("import-workbook-too-large"),
+        OpenError::Workbook(WorkbookError::Unreadable(why)) => {
+            t!("import-workbook-unreadable", error = why.clone())
+        }
+        OpenError::Workbook(WorkbookError::Crashed) => t!("import-workbook-crashed"),
+    }
 }

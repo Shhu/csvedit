@@ -404,6 +404,9 @@ pub struct Format {
     /// The lines left out at the top when the file was read (a title, a
     /// comment, Excel's "sep=;"), written back as they were.
     pub preamble: String,
+    /// Cells a spreadsheet would run as a formula (=, +, -, @ first, and
+    /// not a number) are written with an apostrophe first.
+    pub protect_formulas: bool,
 }
 
 impl Default for Format {
@@ -417,6 +420,7 @@ impl Default for Format {
             encoding: Encoding::Utf8,
             line_ending: LineEnding::native(),
             preamble: String::new(),
+            protect_formulas: false,
         }
     }
 }
@@ -509,6 +513,10 @@ pub struct Imported {
     pub table: Table,
     pub format: Format,
     pub losses: Losses,
+    /// A workbook's formulas: (row, column, formula without "=").
+    pub formulas: Vec<(usize, usize, String)>,
+    /// A workbook's sheets.
+    pub sheets: Vec<String>,
 }
 
 /// The file has too many cells to be opened.
@@ -557,6 +565,7 @@ pub fn import(bytes: &[u8], options: &ImportOptions) -> Result<Imported, TooLarg
         encoding: options.encoding,
         line_ending: parsed.line_ending.unwrap_or_else(LineEnding::native),
         preamble: parsed.preamble,
+        protect_formulas: false,
     };
     let losses = Losses {
         blank_lines: parsed.blank_lines,
@@ -567,6 +576,8 @@ pub fn import(bytes: &[u8], options: &ImportOptions) -> Result<Imported, TooLarg
         table: Table::from_rows(parsed.rows),
         format,
         losses,
+        formulas: Vec::new(),
+        sheets: Vec::new(),
     })
 }
 
@@ -1008,6 +1019,13 @@ pub fn write(table: &Table, format: &Format) -> Result<Vec<u8>, Unencodable> {
             if i > 0 {
                 text.push_str(delimiter);
             }
+            let protected;
+            let cell = if format.protect_formulas && looks_like_formula(cell) {
+                protected = format!("'{cell}");
+                &protected
+            } else {
+                cell
+            };
             if needs_quotes(cell, row.len() == 1, format) {
                 text.push(quote);
                 text.push_str(&cell.replace(quote, &doubled));
@@ -1049,6 +1067,14 @@ pub fn write(table: &Table, format: &Format) -> Result<Vec<u8>, Unencodable> {
             bytes
         }
     })
+}
+
+/// Whether a spreadsheet opening the file would take `cell` for a formula:
+/// it starts with =, +, -, @, a tab or a carriage return, and isn't a
+/// number ("-5" stays as it is).
+fn looks_like_formula(cell: &str) -> bool {
+    cell.starts_with(['=', '+', '-', '@', '\t', '\r'])
+        && cell.trim().replace(',', ".").parse::<f64>().is_err()
 }
 
 /// Where Windows-1252 first fails: in the kept lines, else in a cell.
@@ -1217,6 +1243,20 @@ mod tests {
         t.apply(Edit::Reorder(1, order));
         let column: Vec<_> = t.rows().iter().map(|r| r[0].as_str()).collect();
         assert_eq!(column, ["h", "1,5", "2", "10", "A", "b", ""]);
+    }
+
+    #[test]
+    fn protects_cells_a_spreadsheet_would_run() {
+        let format = Format {
+            protect_formulas: true,
+            line_ending: LineEnding::Lf,
+            ..Format::default()
+        };
+        let t = table(&[&["=1+1", "-5", "@SUM(A1)", "-x", "a=b"]]);
+        assert_eq!(
+            String::from_utf8(write(&t, &format).unwrap()).unwrap(),
+            "'=1+1,-5,'@SUM(A1),'-x,a=b\n"
+        );
     }
 
     #[test]

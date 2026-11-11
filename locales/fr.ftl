@@ -21,6 +21,8 @@ command-open = Ouvrir…
 command-save = Enregistrer
 command-save-as = Enregistrer sous…
 command-quit = Quitter
+protect-formulas = Protéger des formules à l'enregistrement
+protect-formulas-hint = Les cellules commençant par =, +, - ou @ (hors nombres) sont écrites précédées d'une apostrophe, pour qu'Excel ou LibreOffice n'exécutent pas ces formules en ouvrant le fichier CSV.
 command-undo = Annuler
 command-redo = Rétablir
 command-find = Rechercher
@@ -122,6 +124,8 @@ inspector-values = Valeurs
 inspector-empty = Cellules vides
 inspector-longest = Texte le plus long
 inspector-longest-value = { $count } car.
+inspector-formula = Formule : ={ $formula }
+inspector-formula-hint = La cellule affiche le résultat enregistré dans le classeur : il n'est pas recalculé.
 inspector-truncated = Seuls les { $count } premiers caractères sont affichés ; Modifier ouvre le texte entier.
 
 ## Files
@@ -130,6 +134,8 @@ untitled = Sans titre
 untitled-file = sans titre.csv
 filter-csv = Fichiers CSV
 filter-all = Tous les fichiers
+filter-supported = Fichiers CSV et classeurs
+filter-workbooks = Classeurs (Excel, LibreOffice)
 error-open = Impossible d'ouvrir { $file } : { $error }
 error-save = Impossible d'enregistrer { $file } : { $error }
 error-encoding = le caractère « { $character } » ({ $code }) en { $cell } ne peut pas s'écrire en Windows-1252. Modifiez-le, ou choisissez UTF-8 dans la barre d'état.
@@ -171,6 +177,11 @@ import-invalid = { $count ->
    *[other] { $count } suites d'octets illisibles dans ce jeu de caractères, affichées �
 }
 import-open = Importer
+import-sheet = Feuille
+import-workbook = Classeur : valeurs seules (les formules donnent leur résultat enregistré), sans macros
+import-workbook-too-large = trop grand pour être ouvert (trop de cellules, ou une partie qui se décompresse trop grande)
+import-workbook-unreadable = ce n'est pas un classeur lisible ({ $error })
+import-workbook-crashed = le fichier n'a pas pu être lu : il est peut-être abîmé
 
 ## Dialogs
 

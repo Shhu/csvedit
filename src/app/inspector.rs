@@ -75,6 +75,22 @@ impl CsvApp {
             )
         };
         ui.add(egui::Label::new(egui::RichText::new(column).size(13.0).color(p.muted)).truncate());
+        // A workbook's formula: the cell shows the result saved with it.
+        if let Some(formula) = self.formulas.get(&(row, col)) {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!(
+                        "inspector-formula",
+                        formula = capped(formula, 500).into_owned()
+                    ))
+                    .font(theme::mono(12.0))
+                    .color(p.accent_ink),
+                )
+                .wrap(),
+            )
+            .on_hover_text(t!("inspector-formula-hint"));
+        }
         ui.add_space(12.0);
 
         // The text, in a card.

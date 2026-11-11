@@ -1,6 +1,6 @@
 [package]
 name = "csvedit"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A simple CSV editor"
@@ -8,6 +8,7 @@ repository = "https://github.com/Shhu/csvedit"
 build = "build.rs"
 
 [dependencies]
+calamine = "0.38"
 eframe = "0.36.2"
 egui-phosphor = "0.14"
 egui_extras = "0.36.2"
@@ -16,10 +17,12 @@ fluent-bundle = "0.16"
 rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
 sys-locale = "0.3"
 unicode-segmentation = "1"
+zip = { version = "9.5", default-features = false }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }
 fluent-syntax = "0.12"
+rust_xlsxwriter = "0.102.0"
 
 [build-dependencies]
 winresource = "0.1"

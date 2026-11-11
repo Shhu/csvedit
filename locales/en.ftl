@@ -21,6 +21,8 @@ command-open = Open…
 command-save = Save
 command-save-as = Save As…
 command-quit = Quit
+protect-formulas = Protect Formulas When Saving
+protect-formulas-hint = Cells starting with =, +, - or @ (and not numbers) are written with an apostrophe first, so that Excel or LibreOffice opening the CSV file doesn't run them as formulas.
 command-undo = Undo
 command-redo = Redo
 command-find = Find
@@ -122,6 +124,8 @@ inspector-longest-value = { $count ->
     [one] { $count } char
    *[other] { $count } chars
 }
+inspector-formula = Formula: ={ $formula }
+inspector-formula-hint = The cell shows the result saved with the workbook: it isn't calculated again.
 inspector-truncated = Only the first { $count } characters are shown; Edit opens all of it.
 
 ## Files
@@ -130,6 +134,8 @@ untitled = Untitled
 untitled-file = untitled.csv
 filter-csv = CSV files
 filter-all = All files
+filter-supported = CSV files and workbooks
+filter-workbooks = Workbooks (Excel, LibreOffice)
 error-open = Couldn't open { $file }: { $error }
 error-save = Couldn't save { $file }: { $error }
 error-encoding = the character "{ $character }" ({ $code }) in { $cell } can't be written in Windows-1252. Change it, or choose UTF-8 in the status bar.
@@ -171,6 +177,11 @@ import-invalid = { $count ->
    *[other] { $count } byte sequences can't be read in this character set and will show as �
 }
 import-open = Import
+import-sheet = Sheet
+import-workbook = Workbook: values only (formulas give their saved result), no macros
+import-workbook-too-large = too large to open (too many cells, or a part that unzips too large)
+import-workbook-unreadable = not a workbook that can be read ({ $error })
+import-workbook-crashed = the file couldn't be read: it may be damaged
 
 ## Dialogs
 

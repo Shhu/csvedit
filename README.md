@@ -25,6 +25,17 @@ A simple CSV editor, in English and French. Written in Rust with
   "10-20" in the column chooser, or tick them in its list.
 - Columns named A B C, 1 2 3 or 0 1 2 (right click on a column header).
 - Dark and light themes (Help › Theme), three row heights.
+- Opens Excel and LibreOffice workbooks (.xlsx, .xlsm, .xlsb, .xls, .ods)
+  with the calamine crate: pick the sheet; values only (a formula gives the
+  result saved with the file, its text is shown in the inspector), never
+  macros, links or embedded objects. The workbook is read by a separate
+  process (CSV Edit started again with `--read-workbook`), with caps on the
+  unzipped size and the number of cells, so that a damaged or crafted file
+  can at worst be called unreadable. It is saved as a CSV file, never over
+  the workbook.
+- File › Protect Formulas When Saving: cells starting with `=`, `+`, `-` or
+  `@` (and not numbers) are written with an apostrophe first, so that a
+  spreadsheet opening the CSV file doesn't run them (CSV injection).
 - A single executable on Windows, a Flatpak on Linux.
 
 ## Using it
